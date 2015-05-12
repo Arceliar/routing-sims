@@ -39,7 +39,8 @@
 import copy
 import random
 import math
-import heapq
+#import heapq
+import pairheap
 
 ######################
 # Global "constants" #
@@ -276,15 +277,15 @@ def dijkstra(nodestore, startingNodeID):
   # Idea to use heapq and basic implementation taken from stackexchange post
   # http://codereview.stackexchange.com/questions/79025/dijkstras-algorithm-in-python
   results = dict()
-  queue = [(0, startingNodeID)]
-  while queue:
-    dist, nodeID = heapq.heappop(queue)
+  queue = pairheap.Heap((0, startingNodeID), [])
+  while not queue.empty():
+    dist, nodeID = queue.pop()
     if nodeID not in results: # Unvisited, otherwise we skip it
       results[nodeID] = dist
       for peer in nodestore[nodeID].links:
         if peer not in results:
           # Peer is also unvisited, so add to queue
-          heapq.heappush(queue, (dist+LINK_COST, peer))
+          queue.insert((dist+LINK_COST, peer))
   return results
 
 def linkNodes(node1, node2):
