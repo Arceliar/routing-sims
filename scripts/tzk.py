@@ -8,7 +8,7 @@
 # WARNING:
 #   A broken or dishonest node could do the following pretty trivially:
 #     Report incorrect distances, causing other people's routing to break
-#     Lie about their coreness, incorrectly adding them to the landmark set
+#     Lie about their centrality, incorrectly adding them to the landmark set
 #     Silently drop packets
 #     Basically anything else that can go wrong in a distance-vector scheme
 
@@ -67,16 +67,16 @@ class Msg:
 
 class PathInfo:
   def __init__(self, nodeID):
-    self.nodeID    = nodeID   # Identifier, e.g. IPv6
-    self.seq       = 0        # Sequence number (for distance vector routing), possibly network time?
-    self.coreness  = 0        # Approximately equal to k for the k-shell of this node
-    self.distance  = 0        # Distance to node
-    self.landmarks = dict()   # PathInfo of closest landmarks to this node (dist < closestDist+1), really just need nodeID and firstHop
-    self.firstHop  = None     # If this paths is from a landmark, this is the first hop taken from the node on this path
-    self.landDist  = INFINITY # Distance to landmark
-    self.nextHop   = None     # NodeID of peer that is the next hop in the path
-    self.time      = 0        # Time this path info was updated, for timeouts
-    self.changed   = True     # If this info changed since our last send
+    self.nodeID     = nodeID   # Identifier, e.g. IPv6
+    self.seq        = 0        # Sequence number (for distance vector routing), possibly network time?
+    self.centrality = 0        # Approximately equal to k for the k-shell of this node
+    self.distance   = 0        # Distance to node
+    self.landmarks  = dict()   # PathInfo of closest landmarks to this node (dist < closestDist+1), really just need nodeID and firstHop
+    self.firstHop   = None     # If this paths is from a landmark, this is the first hop taken from the node on this path
+    self.landDist   = INFINITY # Distance to landmark
+    self.nextHop    = None     # NodeID of peer that is the next hop in the path
+    self.time       = 0        # Time this path info was updated, for timeouts
+    self.changed    = True     # If this info changed since our last send
 
 class Node:
   def __init__(self, nodeID):
@@ -95,7 +95,7 @@ class Node:
       self.info.seq += 1 # Update seq number periodically
       self.info.changed = True
     changed = False
-    if self.updateCoreness(): changed = True
+    if self.updateCentrality(): changed = True
     if self.updateLandmarks(): changed = True
     self.cleanCluster()
     # Create message
@@ -110,9 +110,9 @@ class Node:
     # Reset changed status for future messages
     self.info.changed = False
     for info in self.landmarks.values():
-      if info.changed: info.changed = False
+      info.changed = False
     for info in self.cluster.values():
-      if info.changed: info.changed = False
+      info.changed = False
     # Decide if we need to send to peers
     send = msg.info.changed or msg.landmarks or msg.cluster
     # Send to peers
@@ -124,28 +124,28 @@ class Node:
         self.links[peer].messages.append(new)
     return changed # Tracks if landmark changed, so we know when the sim can stop
 
-  def updateCoreness(self):
-    # Sets coreness = approximately the number for which this node has at least as many peers which do not have < same coreness
-    peers = sorted(self.peers.values(), key=lambda x: x.coreness, reverse=True)
-    newCore = len(peers)
+  def updateCentrality(self):
+    # Sets centrality = number for which this node has at least as many peers which do not have < same centrality
+    peers = sorted(self.peers.values(), key=lambda x: x.centrality, reverse=True)
+    newCent = len(peers)
     for index in xrange(len(peers)):
-      if peers[index].coreness < index:
-        newCore = index
+      if peers[index].centrality < index:
+        newCent = index
         break
-    changed = (self.info.coreness != newCore)
-    self.info.coreness = newCore
+    changed = (self.info.centrality != newCent)
+    self.info.centrality = newCent
     return changed
 
   def updateLandmarks(self):
     # Update landmarks
     self.landmarks[self.info.nodeID] = self.info
-    landmarks = sorted(self.landmarks.values(), key=lambda x: x.coreness, reverse=True)
-    reqCore = 0
+    landmarks = sorted(self.landmarks.values(), key=lambda x: x.centrality, reverse=True)
+    reqCent = 0
     for index in xrange(len(landmarks)):
       landmark = landmarks[index]
-      if landmark.coreness > index:
-        reqCore = landmark.coreness
-      elif landmark.coreness < reqCore: del self.landmarks[landmark.nodeID]
+      if landmark.centrality > index:
+        reqCent = landmark.centrality
+      elif landmark.centrality < reqCent: del self.landmarks[landmark.nodeID]
     landmarks = self.landmarks.values()
     bestDist = INFINITY
     for landmark in landmarks:
@@ -468,7 +468,7 @@ def main(log=False):
       print "Node {}, landmarks {}, cluster {}".format(node.info.nodeID, len(node.landmarks), len(node.cluster))
     for node in ids:
       if node in store[node].landmarks:
-        print "Landmark {}, coreness {}, peers {}".format(node, store[node].info.coreness, len(store[node].peers))
+        print "Landmark {}, centrality {}, peers {}".format(node, store[node].info.centrality, len(store[node].peers))
   if dump: # Debugging nodestore output
     for node in store.values():
       print "Node", node.info.nodeID, node.info.landmark, "Peers", sorted(node.links.keys())
