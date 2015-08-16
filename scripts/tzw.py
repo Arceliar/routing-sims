@@ -1,17 +1,19 @@
-# Note: I think tzw.py has mostly replaced this
-# It's the ~same thing but with extra constraints that seem to avoid some pathelogical things
-
 # Implementation of Thorup and Zwick's compact routing scheme.
-# The k-core of the network is the intended landmark set
-#   As per "Harnessing Internet Topological Stability in Thorup-Zwick Compact Routing" by Strowes and Perkins
-# A distributed algorithm is used to calculate an approximate k-core
-# Nodes report all ~ equidistant landmarks, the sender selects the closest one
-#   As per the scheme in Strowes's thesis
+# A weight is assigned to each node, read the weight function to understand how
+#   It's kind-of like coreness, so Strowes and Perkins deserve credit for the inspiration there
+#   The difference is it doesn't count peers that are a peer of all your other peers
+#   This keeps the weight of a full-mesh low, so it doesn't disrupt the rest of the network
+#     More precisely, it tries to abstract over subgraphs to avoid coreness inflation
+#     Each node of a subgraph should have a coreness <= what you would have if
+#       you replaced the subgraph with 1 node that had all the subgraph's external peers
+#     At least, that's the goal, I wouldn't be surpised if it can be off by 1 or something
+#     And it needs further testing to confirm it doesn't do anything pathelogical
+# Landmarks are then selected by sorting nodes by (weight, nodeID) and applying cuts
 
 # WARNING:
 #   A broken or dishonest node could do the following pretty trivially:
 #     Report incorrect distances, causing other people's routing to break
-#     Lie about their coreness, incorrectly adding them to the landmark set
+#     Lie about their weight, incorrectly adding them to the landmark set
 #     Silently drop packets
 #     Basically anything else that can go wrong in a distance-vector scheme
 #   That being said, I think all attacks fall into one of the following 2 categories:
@@ -19,12 +21,26 @@
 #     2: Wasting resources by adding a node to a table where it doesn't really belong
 #       But in the worst case, 2 falls back to a traditional dv-scheme
 
+# NOTE: (was formerly a FIXME)
+#   Should probably always keep direct (non-landmark) peers in your own cluster
+#   To make sure you never use a longer path to them
+#   You need to store some per-peer state anyway, so this doesn't change scaling
+#   (Just makes the per-peer space usage higher by a constant factor)
+#   This is currently not done just to keep the clusters "clean" for printouts
+#     (Including all peers would make some clusters huge, make debugging harder)
+#   Actually... that's overly complicated
+#   Don't keep them in cluster, but do check direct peers when forwarding packets
+#     It's just one more hashtable lookup
+#   That gets you the best of both worlds
+#   Done, works great, keeping this comment here as a note
+
 # TODO:
 #   Simulate a DHT to lookup routing info based on just node IP
 #   For now we just assume that we can somehow do a lookup to get a node's nearest location info
+#   We also store a lot of stuff in PathInfo that is actually only needed in the DHT
 
 # TODO?
-#   Possibly use a (LIFO) backpressure queue to route around congestion?
+#   Possibly use a (LIFO) backpressure queue to route around congestion
 
 # TODO?
 #   Keep periodic updates for direct peers
@@ -37,7 +53,7 @@
 #   (Look at what Babel does, for example, to converge faster after movements.)
 
 # FIXME:
-#   Potential routing loop after a topology change.
+#   Potential routing loop immediately after a topology change.
 #   What if a firstHop from a landmark no longer knows a path?
 #     They would forward it back to the landmark
 #     Infinite loop
@@ -45,9 +61,19 @@
 #   These stem from reverting from cluster routing to landmark routing
 #   Easy solution:
 #     Add a bool flag.
-#     Set to true when cluster routing begins, or when sent from landmark
+#     Set to true when no longer routing towards landmark
 #     If no route to dest is known and flag is true, drop packet
 #   Maybe there's a clever fix that doesn't require the added flag
+
+# FIXME:
+#   Work on imporving how we assign weight
+#   Currently it requires knowing all peers' peers, can be expensive in some cases
+#   Maybe there's a better way to implement this and get the same result?
+#   In particular, it sucks in hub-and-spoke, because each spoke needs to know
+#     The full peer list of the hub, which kind of defeats the purpose
+#     Especially since the hub is a landmark and doens't need to keep peers in cluster
+#   Although that seems to only apply for nodes adjacent to landmarks
+#   So maybe it's tolerable...
 
 ###########
 # Imports #
@@ -85,9 +111,9 @@ class PathInfo:
   def __init__(self, nodeID):
     self.nodeID    = nodeID   # Identifier, e.g. IPv6
     self.seq       = 0        # Sequence number (for distance vector routing), possibly network time?
-    self.coreness  = 0        # Approximately equal to k for the k-shell of this node
+    self.weight    = 0        # Used in landmark selection
     self.distance  = 0        # Distance to node
-    self.landmarks = dict()   # firstHop of closest landmarks to this node (dist < closestDist)
+    self.landmarks = dict()   # PathInfo of closest landmarks to this node (dist < closestDist+1), really just need nodeID and firstHop
     self.firstHop  = None     # If this paths is from a landmark, this is the first hop taken from the node on this path
     self.landDist  = INFINITY # Distance to landmark
     self.nextHop   = None     # NodeID of peer that is the next hop in the path
@@ -111,7 +137,7 @@ class Node:
       self.info.seq += 1 # Update seq number periodically
       self.info.changed = True
     changed = False
-    if self.updateCoreness(): changed = True
+    if self.updateWeight(): changed = True
     if self.updateLandmarks(): changed = True
     self.cleanCluster()
     # Create message
@@ -138,32 +164,46 @@ class Node:
         if self.info.nodeID in new.landmarks:
           new.landmarks[self.info.nodeID].firstHop = peer
         if peer in new.landmarks:
-          new.cluster = dict()
+          new.cluster = dict() # No need to tell landmarks about our cluster
         self.links[peer].messages.append(new)
     return changed # Tracks if landmark changed, so we know when the sim can stop
 
-  def updateCoreness(self):
-    # Sets coreness = number for which this node has at least as many peers which do not have < same coreness
-    peers = sorted(self.peers.values(), key=lambda x: (x.coreness, x.nodeID), reverse=True)
-    newCore = len(peers)
-    for index in xrange(len(peers)):
-      if peers[index].coreness < index:
-        newCore = index
+  def updateWeight(self):
+    # Weight is like coreness, but with an extra constraint on which peers count
+    # Only count peers that at least one of your other peers is not peered to
+    # I.e. only count peers for which you provide a useful route between
+    # I think this means that the nodes in a full-mesh sub graph have (about) the same weight
+    #   as if you replaced the sub graph by a single node (with the same links to the outside)
+    #   ... +- 1 or something, because of how things are approximated
+    # I think that's the right thing to do
+    upeers = [] # Peers that matter
+    npeers = set(self.peers) # Peers that our neighbors already know
+    for peer in self.peers:
+      for npeer in list(npeers):
+        if npeer != peer and npeer not in self.links[peer].peers:
+          npeers.discard(npeer)
+    for peer in self.peers:
+      if peer not in npeers: upeers.append(self.peers[peer])
+    upeers.sort(key=lambda x: (x.weight, x.nodeID), reverse=True)
+    newWeight = len(upeers)
+    for index in xrange(len(upeers)):
+      if upeers[index].weight < index:
+        newWeight = index
         break
-    changed = (self.info.coreness != newCore)
-    self.info.coreness = newCore
+    changed = (self.info.weight != newWeight)
+    self.info.weight = newWeight
     return changed
 
   def updateLandmarks(self):
     # Update landmarks
     self.landmarks[self.info.nodeID] = self.info
-    landmarks = sorted(self.landmarks.values(), key=lambda x: (x.coreness, x.nodeID), reverse=True)
-    reqCore = 0
+    landmarks = sorted(self.landmarks.values(), key=lambda x: (x.weight, x.nodeID), reverse=True)
+    reqWeight = 0
     for index in xrange(len(landmarks)):
       landmark = landmarks[index]
-      if landmark.coreness > index:
-        reqCore = landmark.coreness
-      elif landmark.coreness < reqCore: del self.landmarks[landmark.nodeID]
+      if landmark.weight > index:
+        reqWeight = landmark.weight
+      elif landmark.weight < reqWeight: del self.landmarks[landmark.nodeID]
     landmarks = self.landmarks.values()
     bestDist = INFINITY
     for landmark in landmarks:
@@ -172,8 +212,7 @@ class Node:
       if landmark.distance < bestDist: bestDist = landmark.distance
     newMarks = dict()
     for landmark in landmarks:
-      if landmark.distance == bestDist:
-        newMarks[landmark.nodeID] = landmark.firstHop
+      if landmark.distance == bestDist: newMarks[landmark.nodeID] = landmark.firstHop
     changed = (set(self.info.landmarks.keys()) != set(newMarks.keys()))
     self.info.landmarks = newMarks
     self.info.landDist  = bestDist
@@ -238,7 +277,8 @@ class Packet:
       return 1
     # Get nextHop info
     info = None
-    if self.destID in self.carrier.cluster: info = self.carrier.cluster[self.destID]
+    if self.destID in self.carrier.peers: info = self.carrier.peers[self.destID] # Direct peer
+    elif self.destID in self.carrier.cluster: info = self.carrier.cluster[self.destID]
     elif self.destID in self.carrier.landmarks: info = self.carrier.landmarks[self.destID]
     elif self.destLandmark in self.carrier.landmarks: info = self.carrier.landmarks[self.destLandmark]
     atLandmark = False
@@ -401,8 +441,8 @@ def main(log=False):
   #store = makeStoreSquareGrid(32)
   #store = makeStoreHubSpoke(64)
   #store = makeStoreFullMesh(64)
-  store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
-  #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
+  #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
+  store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
   print "Store Created"
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
@@ -487,7 +527,7 @@ def main(log=False):
       print "Node {}, landmarks {}, cluster {}".format(node.info.nodeID, len(node.landmarks), len(node.cluster))
     for node in ids:
       if node in store[node].landmarks:
-        print "Landmark {}, coreness {}, peers {}".format(node, store[node].info.coreness, len(store[node].peers))
+        print "Landmark {}, weight {}, peers {}".format(node, store[node].info.weight, len(store[node].peers))
   if dump: # Debugging nodestore output
     for node in store.values():
       print "Node", node.info.nodeID, node.info.landmark, "Peers", sorted(node.links.keys())
