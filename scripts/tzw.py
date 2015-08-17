@@ -1,12 +1,15 @@
 # Implementation of Thorup and Zwick's compact routing scheme.
 # A weight is assigned to each node, read the weight function to understand how
 #   It's kind-of like coreness, so Strowes and Perkins deserve credit for the inspiration there
-#   The difference is it doesn't count peers that are a peer of all your other peers
-#   This keeps the weight of a full-mesh low, so it doesn't disrupt the rest of the network
-#     More precisely, it tries to abstract over subgraphs to avoid coreness inflation
-#     Each node of a subgraph should have a coreness <= what you would have if
-#       you replaced the subgraph with 1 node that had all the subgraph's external peers
-#     At least, that's the goal, I wouldn't be surpised if it can be off by 1 or something
+#   The difference is it limits weight of a peer based on how useful it is for your other peers
+#     That is, peer.weight = min(coreness, X)
+#       where X = number of other peers not already linked to X
+#       the idea being that linking to a node all your peers can already reach isn't useful
+#       because why would they route though you? They already have a direct connection...
+#       Possibly there's a better constraint to apply than this
+#         The goal is to prevent real networks from picking stupid cores
+#         Not to prevent deliberate attacks, although that would be nice too
+#     At least, that's the goal, I wouldn't be surpised if it can be off by 1-2 or something
 #     And it needs further testing to confirm it doesn't do anything pathelogical
 # Landmarks are then selected by sorting nodes by (weight, nodeID) and applying cuts
 
@@ -169,21 +172,27 @@ class Node:
     return changed # Tracks if landmark changed, so we know when the sim can stop
 
   def updateWeight(self):
-    # Weight is like coreness, but with an extra constraint on which peers count
-    # Only count peers that at least one of your other peers is not peered to
-    # I.e. only count peers for which you provide a useful route between
-    # I think this means that the nodes in a full-mesh sub graph have (about) the same weight
-    #   as if you replaced the sub graph by a single node (with the same links to the outside)
-    #   ... +- 1 or something, because of how things are approximated
-    # I think that's the right thing to do
-    upeers = [] # Peers that matter
-    npeers = set(self.peers) # Peers that our neighbors already know
-    for peer in self.peers:
-      for npeer in list(npeers):
-        if npeer != peer and npeer not in self.links[peer].peers:
-          npeers.discard(npeer)
-    for peer in self.peers:
-      if peer not in npeers: upeers.append(self.peers[peer])
+    # Weight is like coreness, but with an extra constraint
+    # The maximum weight is equal to coreness reported by the node...
+    # OR your number of other peers not linked to that node, whichever is less
+    # but with the usual sort-and-cut restriction on those peers
+    upeers = [] # Modified version of peer infos
+    for peer in self.peers.values():
+      newPeer = copy.copy(peer)
+      npeers = [] # Other peers not linked to peer
+      for peerID in self.peers:
+        if peerID == newPeer.nodeID: continue # Obviously it's not linked to itself...
+        if newPeer.nodeID not in self.links[peerID].peers:
+          npeers.append(self.peers[peerID])
+      npeers.sort(key=lambda x: (x.weight, x.nodeID), reverse=True)
+      unlinked = len(npeers)
+      for index in xrange(len(npeers)):
+        if npeers[index].weight < index:
+          unlinked = index
+          break
+      #print self.info.nodeID, newPeer.nodeID, newPeer.weight, unlinked
+      if unlinked < newPeer.weight: newPeer.weight = unlinked
+      upeers.append(newPeer)
     upeers.sort(key=lambda x: (x.weight, x.nodeID), reverse=True)
     newWeight = len(upeers)
     for index in xrange(len(upeers)):
@@ -391,13 +400,19 @@ def makeStoreHubSpoke(nodes):
   print "Hub and spoke network created, size {}".format(len(store))
   return store
 
-def makeStoreFullMesh(nodes):
+def makeStoreFullMesh(nodes, spokes=0):
   store = dict()
   for nodeID in xrange(nodes):
     store[nodeID] = Node(nodeID)
     for peerID in store:
       if nodeID == peerID: continue
       linkNodes(store[nodeID], store[peerID])
+  if spokes: # Pathelogical thing, add a spoke to each mesh node
+    for nodeID in store.keys():
+      for spokeID in xrange(spokes):
+        newID = str(nodeID)+"-spoke-"+str(spokeID)
+        store[newID] = Node(newID)
+        linkNodes(store[nodeID], store[newID])
   print "Full mesh network created, size {}".format(len(store))
   return store
 
@@ -441,8 +456,8 @@ def main(log=False):
   #store = makeStoreSquareGrid(32)
   #store = makeStoreHubSpoke(64)
   #store = makeStoreFullMesh(64)
-  #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
-  store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
+  store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
+  #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
   print "Store Created"
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
