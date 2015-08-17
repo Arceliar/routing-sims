@@ -11,6 +11,7 @@
 #         Not to prevent deliberate attacks, although that would be nice too
 #     At least, that's the goal, I wouldn't be surpised if it can be off by 1-2 or something
 #     And it needs further testing to confirm it doesn't do anything pathelogical
+#     TODO: Attach peer info to messages, store locally, no abusing node.links[x].peers
 # Landmarks are then selected by sorting nodes by (weight, nodeID) and applying cuts
 
 # WARNING:
@@ -136,11 +137,11 @@ class Node:
     # Periodic maintenance work
     # Update local info
     self.info.time += 1
+    changed = False
     if not self.info.time % (TIMEOUT/4):
       self.info.seq += 1 # Update seq number periodically
       self.info.changed = True
-    changed = False
-    if self.updateWeight(): changed = True
+      if self.updateWeight(): changed = True # Slooooow, so update infrequently
     if self.updateLandmarks(): changed = True
     self.cleanCluster()
     # Create message
@@ -458,6 +459,7 @@ def main(log=False):
   #store = makeStoreFullMesh(64)
   store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
   #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
+  #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
   print "Store Created"
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
@@ -483,6 +485,11 @@ def main(log=False):
   maxCluster = 0
   for node in store.values():
     node.cleanCluster()
+    for peer in node.peers:
+      if peer in node.cluster:
+        # This is a hack to ignore cluster nodes that are also peers
+        # Purely to get a better idea of how space is being used
+        del node.cluster[peer]
     minLandmarks  = min(minLandmarks, len(node.landmarks))
     minCluster    = min(minCluster, len(node.cluster))
     avgLandmarks += len(node.landmarks)
@@ -539,7 +546,7 @@ def main(log=False):
   avgStretch /= max(1, totalChecked)
   if verbose: # Verbose nodesore output
     for node in sorted(store.values(), key=lambda x: (len(x.landmarks), len(x.cluster), x.info.nodeID)):
-      print "Node {}, landmarks {}, cluster {}".format(node.info.nodeID, len(node.landmarks), len(node.cluster))
+      print "Node {}, weight {}, cluster {}, peers {}".format(node.info.nodeID, node.info.weight, len(node.cluster), len(node.peers))
     for node in ids:
       if node in store[node].landmarks:
         print "Landmark {}, weight {}, peers {}".format(node, store[node].info.weight, len(store[node].peers))
