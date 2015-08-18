@@ -1,5 +1,6 @@
-# Note: I think tzw.py has mostly replaced this
+# Note: Also see tzw.py
 # It's the ~same thing but with extra constraints that seem to avoid some pathelogical things
+# Down side is tzw requires more state per node (full list of peers' peers)
 
 # Implementation of Thorup and Zwick's compact routing scheme.
 # The k-core of the network is the intended landmark set
@@ -238,7 +239,8 @@ class Packet:
       return 1
     # Get nextHop info
     info = None
-    if self.destID in self.carrier.cluster: info = self.carrier.cluster[self.destID]
+    if self.destID in self.carrier.peers: info = self.carrier.peers[self.destID] # Direct peer
+    elif self.destID in self.carrier.cluster: info = self.carrier.cluster[self.destID]
     elif self.destID in self.carrier.landmarks: info = self.carrier.landmarks[self.destID]
     elif self.destLandmark in self.carrier.landmarks: info = self.carrier.landmarks[self.destLandmark]
     atLandmark = False
@@ -403,6 +405,7 @@ def main(log=False):
   #store = makeStoreFullMesh(64)
   store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
   #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
+  #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
   print "Store Created"
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
