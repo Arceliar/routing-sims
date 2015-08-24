@@ -421,8 +421,8 @@ def main(log=False):
   #store = makeStoreHubSpoke(64)
   #store = makeStoreFullMesh(64)
   #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
-  store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
-  #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
+  #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
+  store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
   print "Store Created"
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
