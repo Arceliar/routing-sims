@@ -198,6 +198,10 @@ class Node:
       elif self.info.nodeID in self.landmarks: del self.cluster[info.nodeID]
       elif not [v for v in info.landmarks if v in self.landmarks]: del self.cluster[info.nodeID]
       elif not info.distance < info.landDist: del self.cluster[info.nodeID]
+      elif not info.landDist <= info.distance + self.info.landDist + 1:
+        # They claim to be further away from a landmark than what is possible
+        # Plus 1 hop of wiggle room in case things are still converging
+        del self.cluster[info.nodeID]
 
   def handleMessages(self):
     while self.messages:
@@ -293,17 +297,10 @@ def bestInfo(info1, info2):
   else:
     old = info2
     new = info1
-  # Test
-  if new.seq < old.seq: return old
-  if old.seq < new.seq: return new
-  if new.distance < old.distance: return new
-  # End test
-  if new.seq < old.seq: return old
-  if new.seq == old.seq and new.distance < old.distance: return new
-  if new.seq > old.seq:
-    if old.seq+1 < new.seq: return new
-    if new.distance <= old.distance: return new
-  return old
+  if new.seq < old.seq: return old             # Should not happen
+  elif new.distance < old.distance: return new # Switch to better info
+  elif old.seq+1 < new.seq: return new         # Switch away from stale info
+  else: return old                             # Fall back to keeping old info
 
 def dijkstra(nodestore, startingNodeID):
   # Idea to use heapq and basic implementation taken from stackexchange post
@@ -393,6 +390,20 @@ def makeStoreCaidaGraph(pathToGraph):
   print "CAIDA graph successfully imported, size {}".format(len(store))
   return store
 
+def makeStoreASRelGraph(pathToGraph):
+  #Existing network graphs, in caida.org's asrel format (ASx|ASy|z per line, z denotes relationship type)
+  with open(pathToGraph, "r") as f:
+    inData = f.readlines()
+  store = dict()
+  for line in inData:
+    if line.strip(" ")[0] == "#": continue # Skip comment lines
+    nodes = map(int, line.rstrip('\n').split('|')[0:2])
+    if nodes[0] not in store: store[nodes[0]] = Node(nodes[0])
+    if nodes[1] not in store: store[nodes[1]] = Node(nodes[1])
+    linkNodes(store[nodes[0]], store[nodes[1]])
+  print "CAIDA AS-relation graph successfully imported, size {}".format(len(store))
+  return store
+
 def makeStoreHypeGraph(pathToGraph):
   # Expects the format found in http://www.fc00.org/static/graph.json
   import json
@@ -412,20 +423,7 @@ def makeStoreHypeGraph(pathToGraph):
 # Main execution #
 ##################
 
-def main(log=False):
-  # Make any randomness deterministic, to help with reproducibility when debugging
-  random.seed(12345)
-  # Create store
-  print "Creating Store..."
-  #store = makeStoreSquareGrid(32)
-  #store = makeStoreHubSpoke(64)
-  #store = makeStoreFullMesh(64)
-  #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
-  #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
-  store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
-  print "Store Created"
-  for node in store.values():
-    node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
+def main(store, log=""):
   step = 0
   lastChange = 0
   verbose = True # Print out per-node store sizes when done
@@ -472,7 +470,7 @@ def main(log=False):
   totalChecked = 0
   nodeCount = 0
   diameter = 0
-  if log: f = open("lengths.csv", "w")
+  if log: f = open(log, "w")
   for sourceID in ids:
     nodeCount += 1
     print "Testing paths from node {}/{} ({})".format(nodeCount, len(store), sourceID)
@@ -524,7 +522,44 @@ def main(log=False):
   print "Stretch (Avg / Max): {} / {}".format(avgStretch, maxStretch)
   print "Bandwidth usage: {}".format(float(totalHops)/max(1, totalExpected))
   print "Node min/avg/max store sizes: {}+{} / {}+{} / {}+{}".format(minLandmarks, minCluster, avgLandmarks, avgCluster, maxLandmarks, maxCluster)
-  return store
+  print "Network size: {}".format(len(store))
+  return store, (len(store), avgStretch, minLandmarks+minCluster, avgLandmarks+avgCluster, maxLandmarks+maxCluster)
 
-main()
+if __name__ == "__main__":
+  # Make any randomness deterministic, to help with reproducibility when debugging
+  random.seed(12345)
+  # Create store
+  #store = makeStoreSquareGrid(16)
+  #store = makeStoreHubSpoke(64)
+  #store = makeStoreFullMesh(64)
+  #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
+  #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
+  #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
+  #store = makeStoreASRelGraph("asrel/datasets/19980101.as-rel.txt")
+  #for node in store.values():
+  #  node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
+  #main(store) # And we're off...
+  import glob
+  import os
+  paths = sorted(glob.glob("asrel/datasets/*"))
+  if not os.path.exists("output"): os.makedirs("output")
+  exists = sorted(glob.glob("output/*"))
+  for path in paths:
+    date = os.path.basename(path).split(".")[0]
+    outpath = "output/{}".format(date)
+    if outpath in exists:
+      print "Skipping {}, already processed".format(date)
+      continue
+    store = makeStoreASRelGraph(path)
+    print "Beginning {}, size {}".format(date, len(store))
+    _, info = main(store)
+    with open(outpath, "w") as f:
+      nodes    = info[0]
+      stretch  = info[1]
+      minTable = info[2]
+      avgTable = info[3]
+      maxTable = info[4]
+      results = "{}, {}, {}, {}, {}".format(nodes, stretch, minTable, avgTable, maxTable)
+      f.write(results)
+    print "Finished {}".format(date)
 
