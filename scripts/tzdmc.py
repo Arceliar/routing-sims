@@ -276,7 +276,7 @@ class Packet:
       print "Hops used", self.hops
       return 3
     # Forward the packet
-    self.hops.append(self.carrier.info.nodeID)
+    #self.hops.append(self.carrier.info.nodeID) # No loops and this is generating garbage
     if atLandmark: nextHop = self.firstHop
     else: nextHop = info.nextHop
     if nextHop not in self.carrier.links:
@@ -336,6 +336,19 @@ def cloneMsg(msg):
   for info in msg.cluster.values():
     new.cluster[info.nodeID] = copy.copy(info)
   return new
+
+def testRoute(packet):
+  hops = 0
+  while True:
+    status = packet.next()
+    if status == 0:
+      hops += 1
+      continue
+    elif status != 1:
+      print status
+      assert False # DEBUG
+    break
+  return hops
 
 ############################
 # Store topology functions #
@@ -467,6 +480,8 @@ def main(store, log=""):
   totalExpected = 0
   avgStretch = 0
   maxStretch = 0
+  sAvgStretch = 0
+  sMaxStretch = 0
   totalChecked = 0
   nodeCount = 0
   diameter = 0
@@ -478,34 +493,30 @@ def main(store, log=""):
     for destID in ids:
       if sourceID == destID: continue     # Don't test self-route
       if destID not in expected: continue # No route exists
+      # Test forward and reverse routes, pick shortest dist
       packet = Packet(store[sourceID], store[destID])
-      hops = 0
-      while True:
-        status = packet.next()
-        if status == 0:
-          hops += 1
-          continue
-        elif status == 1:
-          # handle success
-          maxHops = max(maxHops, hops)
-          totalHops += hops
-          diameter = max(diameter, expected[destID])
-          totalExpected += expected[destID]
-          stretch = float(hops)/max(1, expected[destID])
-          avgStretch += stretch
-          maxStretch = max(maxStretch, stretch)
-          totalChecked += 1
-          if log:
-            result = (sourceID, destID, expected[destID], hops)
-            line = ",".join(map(str, result)) + "\n"
-            f.write(line)
-        else:
-          print status
-          dump = True
-          assert False # DEBUG
-        break
+      hops = testRoute(packet)
+      rpacket = Packet(store[destID], store[sourceID])
+      rhops = testRoute(rpacket)
+      sHops = min(hops, rhops)
+      maxHops = max(maxHops, hops)
+      totalHops += hops
+      diameter = max(diameter, expected[destID])
+      totalExpected += expected[destID]
+      stretch = float(hops)/max(1, expected[destID])
+      sStretch = float(sHops)/max(1, expected[destID])
+      avgStretch += stretch
+      sAvgStretch += sStretch
+      maxStretch = max(maxStretch, stretch)
+      sMaxStretch = max(sStretch, sMaxStretch)
+      totalChecked += 1
+      if log:
+        result = (sourceID, destID, expected[destID], hops)
+        line = ",".join(map(str, result)) + "\n"
+        f.write(line)
   if log: f.close()
   avgStretch /= max(1, totalChecked)
+  sAvgStretch /= max(1, totalChecked)
   if verbose: # Verbose nodesore output
     for node in sorted(store.values(), key=lambda x: (len(x.landmarks), len(x.cluster), x.info.nodeID)):
       print "Node {}, weight {}, cluster {}, peers {}".format(node.info.nodeID, node.info.weight, len(node.cluster), len(node.peers))
@@ -520,14 +531,16 @@ def main(store, log=""):
       print # Blank line
   print "Max hops used / graph diameter: {} / {}".format(maxHops, diameter)
   print "Stretch (Avg / Max): {} / {}".format(avgStretch, maxStretch)
+  print "Source-route stretch (Avg / Max): {} / {}".format(sAvgStretch, sMaxStretch)
   print "Bandwidth usage: {}".format(float(totalHops)/max(1, totalExpected))
   print "Node min/avg/max store sizes: {}+{} / {}+{} / {}+{}".format(minLandmarks, minCluster, avgLandmarks, avgCluster, maxLandmarks, maxCluster)
   print "Network size: {}".format(len(store))
-  return store, (len(store), avgStretch, minLandmarks+minCluster, avgLandmarks+avgCluster, maxLandmarks+maxCluster)
+  return store, (len(store), avgStretch, sAvgStretch, minLandmarks+minCluster, avgLandmarks+avgCluster, maxLandmarks+maxCluster)
 
 if __name__ == "__main__":
   # Make any randomness deterministic, to help with reproducibility when debugging
   random.seed(12345)
+  store = dict()
   # Create store
   #store = makeStoreSquareGrid(16)
   #store = makeStoreHubSpoke(64)
@@ -535,31 +548,34 @@ if __name__ == "__main__":
   #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
   #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
   #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
-  #store = makeStoreASRelGraph("asrel/datasets/19980101.as-rel.txt")
-  #for node in store.values():
-  #  node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
-  #main(store) # And we're off...
-  import glob
-  import os
-  paths = sorted(glob.glob("asrel/datasets/*"))
-  if not os.path.exists("output"): os.makedirs("output")
-  exists = sorted(glob.glob("output/*"))
-  for path in paths:
-    date = os.path.basename(path).split(".")[0]
-    outpath = "output/{}".format(date)
-    if outpath in exists:
-      print "Skipping {}, already processed".format(date)
-      continue
-    store = makeStoreASRelGraph(path)
-    print "Beginning {}, size {}".format(date, len(store))
-    _, info = main(store)
-    with open(outpath, "w") as f:
-      nodes    = info[0]
-      stretch  = info[1]
-      minTable = info[2]
-      avgTable = info[3]
-      maxTable = info[4]
-      results = "{}, {}, {}, {}, {}".format(nodes, stretch, minTable, avgTable, maxTable)
-      f.write(results)
-    print "Finished {}".format(date)
+  store = makeStoreASRelGraph("asrel/datasets/19980101.as-rel.txt")
+  for node in store.values():
+    node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
+  if store: main(store) # And we're off...
+  else:
+    import glob
+    import os
+    paths = sorted(glob.glob("asrel/datasets/*"))
+    if not os.path.exists("output"): os.makedirs("output")
+    exists = sorted(glob.glob("output/*"))
+    for path in paths:
+      date = os.path.basename(path).split(".")[0]
+      outpath = "output/{}".format(date)
+      if outpath in exists:
+        print "Skipping {}, already processed".format(date)
+        continue
+      store = makeStoreASRelGraph(path)
+      print "Beginning {}, size {}".format(date, len(store))
+      _, info = main(store)
+      with open(outpath, "w") as f:
+        nodes    = info[0]
+        stretch  = info[1]
+        sStretch = info[2]
+        minTable = info[3]
+        avgTable = info[4]
+        maxTable = info[5]
+        results = "{}, {}, {}, {}, {}, {}".format(nodes, stretch, sStretch, minTable, avgTable, maxTable)
+        f.write(results)
+      print "Finished {}".format(date)
+      break # Stop after 1, because they take forever
 
