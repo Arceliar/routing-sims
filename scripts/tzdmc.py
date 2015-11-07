@@ -169,7 +169,7 @@ class Node:
 
   def updateLandmarks(self):
     # Update landmarks
-    self.landmarks[self.info.nodeID] = self.info
+    self.landmarks[self.info.nodeID] = copy.copy(self.info)
     landmarks = sorted(self.landmarks.values(), key=lambda x: (x.weight, x.nodeID), reverse=True)
     reqWeight = 0
     for index in xrange(len(landmarks)):
@@ -493,23 +493,26 @@ def main(store, log=""):
     for destID in ids:
       if sourceID == destID: continue     # Don't test self-route
       if destID not in expected: continue # No route exists
-      # Test forward and reverse routes, pick shortest dist
-      packet = Packet(store[sourceID], store[destID])
-      hops = testRoute(packet)
+      # Test forward and reverse routes, pick shortest dist for source route
+      # Add reverse route info to totals now, to skip double-checking later
+      if destID < sourceID: continue # And then skip double-checking later...
+      fpacket = Packet(store[sourceID], store[destID])
+      fhops = testRoute(fpacket) # ping
       rpacket = Packet(store[destID], store[sourceID])
-      rhops = testRoute(rpacket)
-      sHops = min(hops, rhops)
-      maxHops = max(maxHops, hops)
-      totalHops += hops
-      diameter = max(diameter, expected[destID])
-      totalExpected += expected[destID]
-      stretch = float(hops)/max(1, expected[destID])
+      rhops = testRoute(rpacket) # pong
+      for hops in fhops, rhops:
+        maxHops = max(maxHops, hops)
+        totalHops += hops
+        diameter = max(diameter, expected[destID])
+        totalExpected += expected[destID]
+        stretch = float(hops)/max(1, expected[destID])
+        avgStretch += stretch
+        maxStretch = max(maxStretch, stretch)
+        totalChecked += 1
+      sHops = min(fhops, rhops) # Length of source-routed path
       sStretch = float(sHops)/max(1, expected[destID])
-      avgStretch += stretch
-      sAvgStretch += sStretch
-      maxStretch = max(maxStretch, stretch)
+      sAvgStretch += 2*sStretch # For forward and reverse paths
       sMaxStretch = max(sStretch, sMaxStretch)
-      totalChecked += 1
       if log:
         result = (sourceID, destID, expected[destID], hops)
         line = ",".join(map(str, result)) + "\n"
@@ -530,8 +533,8 @@ def main(store, log=""):
       print "Landmarks", map(lambda x: (x.nodeID, x.distance, x.firstHop), sorted(node.landmarks.values(), key=lambda x: x.nodeID))
       print # Blank line
   print "Max hops used / graph diameter: {} / {}".format(maxHops, diameter)
-  print "Stretch (Avg / Max): {} / {}".format(avgStretch, maxStretch)
   print "Source-route stretch (Avg / Max): {} / {}".format(sAvgStretch, sMaxStretch)
+  print "Stretch (Avg / Max): {} / {}".format(avgStretch, maxStretch)
   print "Bandwidth usage: {}".format(float(totalHops)/max(1, totalExpected))
   print "Node min/avg/max store sizes: {}+{} / {}+{} / {}+{}".format(minLandmarks, minCluster, avgLandmarks, avgCluster, maxLandmarks, maxCluster)
   print "Network size: {}".format(len(store))
@@ -545,10 +548,10 @@ if __name__ == "__main__":
   #store = makeStoreSquareGrid(16)
   #store = makeStoreHubSpoke(64)
   #store = makeStoreFullMesh(64)
-  #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
+  store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
   #store = makeStoreCaidaGraph("bgp_tables") # Internet AS graph, from bgp tables
   #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
-  store = makeStoreASRelGraph("asrel/datasets/19980101.as-rel.txt")
+  #store = makeStoreASRelGraph("asrel/datasets/19980101.as-rel.txt")
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT) # Start w/ random node time
   if store: main(store) # And we're off...
@@ -557,6 +560,7 @@ if __name__ == "__main__":
     import os
     paths = sorted(glob.glob("asrel/datasets/*"))
     if not os.path.exists("output"): os.makedirs("output")
+    assert os.path.exists("output")
     exists = sorted(glob.glob("output/*"))
     for path in paths:
       date = os.path.basename(path).split(".")[0]
