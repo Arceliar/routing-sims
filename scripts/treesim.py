@@ -4,11 +4,6 @@
 #   2: Build spanning tree, each node stores path back to root
 #     Optionally with weights for each hop
 #   3: Keep track of extra shortcuts where the tree stretch is too high
-#     TODO:
-#       Minimal set of shortcuts needed
-#       Storing all nodes that break stretch bound is too much
-#       Current subset being used appears to be slightly wrong
-#       (Very rarely, violate stretch bounds, appears to be asymmetric)
 #   4: Use distance of shortcuts + remaining tree distance as a distance metric
 #   5: Perform (modified) greedy lookup via this metric for each direction (A->B and B->A)
 #   6: Source-route traffic using the shorter/better of those two paths
@@ -18,8 +13,10 @@
 #   To test if/when max stretch bounds are violated
 #   Switch back to greedy ones to see average stretch in practice (much better)
 
-# FIXME
-#   The stretch bound is some paths for the current requirements
+# TODO
+#   We keep the smallest amount of info I could find that doesn't break stretch bound
+#   There's an alternative subset of info to store, but it isn't perfect
+#   Keeps much less info, but the stretch bound is violated for some paths
 #   Caused by something like the following:
 #     B->X->D is known by B, B does not care about X
 #     B->C->D also exists, B does care about C
@@ -27,10 +24,13 @@
 #     A->B->C is short enough that A would care about it, if A heard
 #   Attempted fix: have B switch to using B->C->D instead of B->X->D
 #   Problem: This caused oscillation in some networks
-#   For now, just living with the excess stretch in some routes
-#     Thus far, have never found a path where A->D and D->A both violate stretch bound
-#     So we meet our requirements in the source-routed scenario
-#     But that may just be luck, haven't been able to prove anything either way
+#   It's rare for this to be a problem (most paths are fine)
+#   If table size with the normal requirement becomes too high, switch to this
+#     On a node-by-node basis
+#     It will let you drop paths that are unlikely to cause stretch issues
+#   In the long term, figure out the minimum set needed is, just use that
+#     This is probably difficult
+#     Problems come from interactions between nodes, not 1 node's view
 
 # TODO:
 #   Investigate using Peleg's distance labeling scheme for trees (also used in the bc scheme)
@@ -41,7 +41,8 @@
 # TODO:
 #   Make better use of drop?
 #   In particular, we should be ignoring *all* recently dropped *paths* to the root
-#   (To minimize route flapping)
+#     To minimize route flapping
+#     Not really an issue in the sim, but needed for a real network
 
 import random
 import heapq
@@ -137,7 +138,6 @@ class Node:
     changed = False
     nodes = self.clus.values()
     for node in nodes:
-      pathDist = len(node.path)-1 # Don't count self, at end of path...
       if self.info.time - node.time > TIMEOUT:
         # Timed out
         self.drop[node.nodeID] = node
@@ -164,39 +164,33 @@ class Node:
     if (info.coords[0] != self.info.coords[0]): return False
     assert(info.path[-1] == self.info.nodeID)
     tPath = treePath(self.info.coords, info.coords) # DEBUG
-    assert tPath[0] == self.info.nodeID # DEBUG
-    assert tPath[-1] == info.nodeID # DEBUG
+    assert tPath[-1] == self.info.nodeID # DEBUG
+    assert tPath[0] == info.nodeID # DEBUG
     pathLength = len(info.path)-1 # The last hop is ourself, doesn't count
     treeLength = treeDist(self.info.coords, info.coords)
-    if not pathLength*MAX_MS + MAX_AS < treeLength: return False # Stretch is tolerable
-    best = self.info
-    bestDist = treeLength
-    for nodeID in self.clus:
-      # Possibly sort the keys, just in case not sorting leads to some kind of oscllation
-      # (Don't think it does, but hard to prove either way)
+    maxAllowedHops = pathLength*MAX_MS + MAX_AS
+    if not maxAllowedHops < treeLength: return False # Stretch is tolerable
+    hasBetterPath = False
+    for nodeID in self.clus: # Possibly sort keys first? (Is oscillation possible?)
+      if nodeID == info.nodeID: continue
       node = self.clus[nodeID]
-      if node.nodeID == info.nodeID: continue
-      dist = len(node.path)-1 + treeDist(node.coords, info.coords)
-      if dist < bestDist:
-        best = node
-        bestDist = dist
-    if not pathLength < bestDist: return False
-    # There's may be additional cases where we can safely throw info away
-    # If you ever find any, this is where to put them
-    if pathLength*MAX_MS + MAX_AS < bestDist:
-      # The stretch of the best route is too high
-      # By itself, this is insufficient
-      # We can keep A->X->C(->B) instead of A->B(->C), former exceeds bounds
-      return True
-    # Next, determine if we could replace the best node
-    # FIXME:
-    #   Unfortunately, by itself, this oscillates
-    #   See: stretch (3,0) 16x16 grid w/ seed 12345, nodes 16 and 183
-    #   Without it, some paths can have stretch > max allowed
-    #   Although, so far, I haven't seen source-routed stretch break the bound
-    #     (One of the two paths has always been low enough to be allowed)
-    #reverseDist = len(info.path)-1 + treeDist(info.coords, best.coords)
-    #if reverseDist < bestDist: return True
+      nodePathLength = len(node.path)-1
+      infoNodeSeparation = treeDist(node.coords, info.coords)
+      infoDistViaNode = nodePathLength + infoNodeSeparation
+      if infoDistViaNode < treeLength:
+        # Node would be a better route to info than via us
+        maxAllowedNodeHops = nodePathLength*MAX_MS + MAX_AS
+        if not maxAllowedHops < maxAllowedNodeHops + infoNodeSeparation:
+          # The worst-case path via node would have tolerable stretch
+          #   (Can't use actual path, because our peers may think differently)
+          #   (There are probably ways to throw out more info than this and still work)
+          # If routing table size becomes too large, then instead check:
+          #   if not maxAllowedHops < infoDistViaNode:
+          # That's unsafe (it sometimes causes stretch to be violated)
+          # But it tends to keep stretch under the bound for the vast majority of paths
+          # So use that to prioritize which info to keep or drop
+          hasBetterPath = True
+    if not hasBetterPath: return True
     return False
 
   def createMessage(self):
@@ -298,7 +292,7 @@ class Node:
     else:
       tPath = treePath(self.info.coords, dest.coords)
       #print "DEBUG TREE:", self.info.nodeID, tPath
-      next = tPath[1]
+      next = tPath[-2]
     assert next in self.peers
     return next
 
@@ -327,9 +321,9 @@ def treePath(source, dest):
   for idx in xrange(shortest):
     if source[idx] == dest[idx]: lastMatch = idx
     else: break
-  path = source[-1:lastMatch:-1] + dest[lastMatch:]
-  assert path[0] == source[-1]
-  assert path[-1] == dest[-1]
+  path = dest[-1:lastMatch:-1] + source[lastMatch:]
+  assert path[0] == dest[-1]
+  assert path[-1] == source[-1]
   return path
 
 def treeDist(source, dest):
@@ -495,9 +489,6 @@ def testPaths(store):
           #return store # Debug it
           #assert False
         if not hops or nHops < hops: hops = nHops
-      if hops > maxAllowedLength:
-        print "EXCEEDED MAX ALLOWED SOURCE-ROUTED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
-        assert False
       stretch = float(hops)/max(1, eHops)
       avgStretch += 2*stretch
       maxStretch = max(maxStretch, stretch)
@@ -530,15 +521,12 @@ def testWorstCasePaths(store):
         sourceInfo = store[pair[0]].info
         destInfo = store[pair[1]].info
         nHops = store[sourceInfo.nodeID].getWorstCasePathLength(destInfo)
-        #if nHops > maxAllowedLength:
+        if nHops > maxAllowedLength:
           # Disregard, new scheme requires handshake for stretch bound to work...why?
-          #print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
+          print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength
           #return store # Debug it
-          #assert False
+          assert False
         if not hops or nHops < hops: hops = nHops
-      if hops > maxAllowedLength:
-        print "EXCEEDED MAX ALLOWED SOURCE-ROUTED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
-        assert False
       stretch = float(hops)/max(1, eHops)
       avgStretch += 2*stretch
       maxStretch = max(maxStretch, stretch)
@@ -559,8 +547,8 @@ def main(store):
   # First print some table size info, since testing paths takes forever
   avgClus, maxClus = getClusterSizes(store)
   # Now test the paths, takes forever, unless you use the worst-case paths only
-  #avgStretch, maxStretch = testWorstCasePaths(store)
-  avgStretch, maxStretch = testPaths(store)
+  avgStretch, maxStretch = testWorstCasePaths(store) # TODO finish testing w/ this
+  #avgStretch, maxStretch = testPaths(store)
   print "Finished testing network"
   print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
   print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
@@ -589,10 +577,13 @@ def processASRelFiles():
     avgStretch, maxStretch = 0, 0 # In case we skip testing paths
     avgStretch, maxStretch = testWorstCasePaths(store) # Fast-ish worst-case test
     #avgStretch, maxStretch = testPaths(store) # Comment out to skip, slow
+    print "Finished testing network"
+    print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
+    print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
     with open(outpath, "w") as f:
       results = "{}, {}, {}, {}, {}".format(len(store), avgClus, maxClus, avgStretch, maxStretch)
       f.write(results)
-    print "Finished {}".format(date)
+    print "Finished {} with {} nodes".format(date, len(store))
     break # Stop after 1, because they can take forever
 
 if __name__ == "__main__":
