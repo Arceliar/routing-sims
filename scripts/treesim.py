@@ -116,8 +116,9 @@ class Node:
       changed = True
     self.cleanDropped()
     # Should probably send messages infrequently if there's nothing new to report
-    msg = self.createMessage()
-    self.sendMessage(msg)
+    if self.info.tstamp == self.info.time:
+      msg = self.createMessage()
+      self.sendMessage(msg)
     return changed
 
   def cleanRoot(self):
@@ -429,6 +430,37 @@ def makeStoreASRelGraph(pathToGraph):
   print "CAIDA AS-relation graph successfully imported, size {}".format(len(store))
   return store
 
+def makeStoreASRelGraphMaxDeg(pathToGraph):
+  #Existing network graphs, in caida.org's asrel format (ASx|ASy|z per line, z denotes relationship type)
+  with open(pathToGraph, "r") as f:
+    inData = f.readlines()
+  store = dict()
+  nodeDeg = dict()
+  for line in inData:
+    if line.strip(" ")[0] == "#": continue # Skip comment lines
+    nodes = map(int, line.rstrip('\n').split('|')[0:2])
+    if nodes[0] not in nodeDeg: nodeDeg[nodes[0]] = 0
+    if nodes[1] not in nodeDeg: nodeDeg[nodes[1]] = 0
+    nodeDeg[nodes[0]] += 1
+    nodeDeg[nodes[1]] += 1
+  maxDegNodeID = None
+  maxDeg = 0
+  for nodeID in nodeDeg:
+    deg = nodeDeg[nodeID]
+    if maxDeg < deg:
+      maxDeg = deg
+      maxDegNodeID = nodeID
+  for line in inData:
+    if line.strip(" ")[0] == "#": continue # Skip comment lines
+    nodes = map(int, line.rstrip('\n').split('|')[0:2])
+    if nodes[0] == maxDegNodeID: nodes[0] += 1000000000
+    if nodes[1] == maxDegNodeID: nodes[1] += 1000000000
+    if nodes[0] not in store: store[nodes[0]] = Node(nodes[0])
+    if nodes[1] not in store: store[nodes[1]] = Node(nodes[1])
+    linkNodes(store[nodes[0]], store[nodes[1]])
+  print "CAIDA AS-relation graph successfully imported, size {}".format(len(store))
+  return store
+
 def makeStoreHypeGraph(pathToGraph):
   # Expects the format found in http://www.fc00.org/static/graph.json
   import json
@@ -573,7 +605,8 @@ def testWorstCasePaths(store):
 
 def main(store):
   for node in store.values():
-    node.time = random.randint(0, TIMEOUT)
+    node.info.time = random.randint(0, TIMEOUT)
+    node.info.tstamp = TIMEOUT
   print "Begin testing network"
   idleUntilConverged(store)
   # First print some table size info, since testing paths takes forever
@@ -602,16 +635,18 @@ def processASRelFiles():
     if outpath in exists:
       print "Skipping {}, already processed".format(date)
       continue
-    store = makeStoreASRelGraph(path)
+    #store = makeStoreASRelGraph(path)
+    store = makeStoreASRelGraphMaxDeg(path)
     for node in store.values():
-      node.time = random.randint(0, TIMEOUT)
+      node.info.time = random.randint(0, TIMEOUT)
+      node.info.tstamp = TIMEOUT
     print "Beginning {}, size {}".format(date, len(store))
     # Main takes too long, just idle and get cluster sizes
     idleUntilConverged(store)
     avgClus, maxClus = getClusterSizes(store)
-    avgStretch, maxStretch, badPaths, checked = 0, 0, 0, 1 # In case we skip testing paths
-    avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # Fast-ish worst-case test
-    #avgStretch, maxStretch = testPaths(store) # Comment out to skip, slow
+    avgStretch, maxStretch, badPaths, checked = 0, 0, 0, 0 # In case we skip testing paths, to only check routing table sizes
+    #avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # Fast-ish worst-case test
+    #avgStretch, maxStretch, badPaths, checked = testPaths(store) # Comment out to skip, slow
     print "Finished testing network"
     print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
     print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
