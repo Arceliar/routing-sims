@@ -14,6 +14,11 @@
 #   Switch back to greedy ones to see average stretch in practice (much better)
 
 # TODO
+#   Looping over peers/cluster for the lookup is slow
+#   Pre-compute some table to speed up the lookups
+#     (Mostly go by matching prefix in tree)
+
+# TODO
 #   We keep the smallest amount of info I could find that doesn't break stretch bound
 #   There's an alternative subset of info to store, but it isn't perfect
 #   Keeps much less info, but the stretch bound is violated for some paths
@@ -56,7 +61,7 @@ import heapq
 # x = shortest path length between two nodes in the network
 # m = multiplicative stretch, MAX_MS
 # b = additive stretch, MAX_AS
-MAX_MS = 3
+MAX_MS = 0
 MAX_AS = 0
 
 # Reminder of where link cost comes in
@@ -172,6 +177,10 @@ class Node:
     pathLength = len(info.path)-1 # The last hop is ourself, doesn't count
     treeLength = treeDist(self.info.coords, info.coords)
     maxAllowedDist = pathLength*MAX_MS + MAX_AS
+    if not maxAllowedDist:
+      # Special case, set stretch to (0, 0) to keep nothing
+      # To test what stretch is like if you only use neighbor info
+      return False
     if not maxAllowedDist < treeLength: return False # Stretch is tolerable
     hasBetterPath = False
     for nodeID in self.clus: # Possibly sort keys first? (Is oscillation possible?)
@@ -285,7 +294,15 @@ class Node:
       self.info.coords = self.root.path
     return changed
 
+  def createLookupCache(self):
+    # Purely to speed up path stretch testing
+    # Eats a lot of memory
+    self.lookupCache = dict()
+    return None
+
   def lookup(self, dest):
+    if hasattr(self, 'lookupCache') and dest.nodeID in self.lookupCache:
+      return self.lookupCache[dest.nodeID]
     best = self.info
     bestDist = treeDist(self.info.coords, dest.coords)
     # <= means we prefer to replace ourself w/ a peer, and a peer w/ a cluster node
@@ -308,6 +325,7 @@ class Node:
       #print "DEBUG TREE:", self.info.nodeID, tPath
       next = tPath[-2]
     assert next in self.peers
+    if hasattr(self, 'lookupCache'): self.lookupCache[dest.nodeID] = next
     return next
 
   def getWorstCasePathLength(self, dest):
@@ -509,10 +527,15 @@ def getClusterSizes(store):
   print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
   return avgClus, maxClus
 
-def testPaths(store):
+def testPathsSourceRouted(store):
+  for node in store.itervalues():
+    # Use a LOT more memory to run the tests faster
+    node.createLookupCache()
   nodeIDs = sorted(store.keys())
   maxStretch = 0.0
   avgStretch = 0.0
+  maxStretchNoSource = 0.0
+  avgStretchNoSource = 0.0
   checked = 0
   nodesChecked = 0
   badPaths = 0
@@ -543,7 +566,10 @@ def testPaths(store):
           loc = next
           path.append(loc)
         nHops = len(path)-1
-        if nHops > maxAllowedLength:
+        stretchNoSource = float(nHops)/max(1, eHops)
+        avgStretchNoSource += stretchNoSource
+        maxStretchNoSource = max(maxStretchNoSource, stretchNoSource)
+        if nHops > maxAllowedLength and maxAllowedLength:
           print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
           #return store # Debug it
           #assert False
@@ -553,10 +579,73 @@ def testPaths(store):
       avgStretch += 2*stretch
       maxStretch = max(maxStretch, stretch)
       checked += 2
+    timeToClean = not nodesChecked % 1000 #int(len(nodeIDs)**0.5)
+    for node in store.itervalues():
+      if hasattr(node, 'lookupCache'):
+        if timeToClean:
+          # DEBUG, keep mem usage down by cleaning everything periodically
+          node.lookupCache.clear()
+        if sourceID in node.lookupCache:
+          # We'll never need this again, so clean it up
+          del node.lookupCache[sourceID]
   avgStretch /= max(1, checked)
+  avgStretchNoSource /= max(1, checked)
   print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
+  print "Avg / Max normal-routed stretch: {} / {}".format(avgStretchNoSource, maxStretchNoSource)
   print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
   return avgStretch, maxStretch, badPaths, checked
+
+def testPaths(store):
+  for node in store.itervalues():
+    node.createLookupCache()
+  nodeIDs = sorted(store.keys())
+  maxStretchNoSource = 0.0
+  avgStretchNoSource = 0.0
+  checked = 0
+  nodesChecked = 0
+  badPaths = 0
+  for destID in nodeIDs:
+    nodesChecked += 1
+    clus = len(store[destID].clus)
+    print "Testing paths to node {} / {} ({}) ({})".format(nodesChecked, len(nodeIDs), destID, clus)
+    expected = dijkstra(store, destID)
+    for sourceID in nodeIDs:
+      if sourceID == destID: continue # No point in testing path to self, or retesting an already tested path
+      if sourceID not in expected: continue # The network is split, no path exists
+      eHops = expected[sourceID]
+      maxAllowedLength = eHops*MAX_MS + MAX_AS
+      hops = 0
+      sourceInfo = store[sourceID].info
+      destInfo = store[destID].info
+      loc = sourceInfo.nodeID
+      path = [loc]
+      while loc != destInfo.nodeID:
+        next = store[loc].lookup(destInfo)
+        if next in path:
+          print "ROUTING LOOP!"
+          print sourceInfo.nodeID, sourceInfo.coords, destInfo.nodeID, destInfo.coords, loc, next, path
+          #return store # Debug it
+          #assert False
+          break
+        loc = next
+        path.append(loc)
+      nHops = len(path)-1
+      if nHops > maxAllowedLength and maxAllowedLength:
+        print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
+        #return store # Debug it
+        #assert False
+        badPaths += 1
+      stretchNoSource = float(nHops)/max(1, eHops)
+      avgStretchNoSource += stretchNoSource
+      maxStretchNoSource = max(maxStretchNoSource, stretchNoSource)
+      checked += 1
+    for node in store.itervalues():
+      if hasattr(node, 'lookupCache'):
+        node.lookupCache.clear()
+  avgStretchNoSource /= max(1, checked)
+  print "Avg / Max normal-routed stretch: {} / {}".format(avgStretchNoSource, maxStretchNoSource)
+  print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
+  return avgStretchNoSource, maxStretchNoSource, badPaths, checked
 
 def testWorstCasePaths(store):
   # This version checks the lengths of the path according to each node's store
@@ -583,7 +672,7 @@ def testWorstCasePaths(store):
         sourceInfo = store[pair[0]].info
         destInfo = store[pair[1]].info
         nHops = store[sourceInfo.nodeID].getWorstCasePathLength(destInfo)
-        if nHops > maxAllowedLength:
+        if nHops > maxAllowedLength and maxAllowedLength:
           # Disregard, new scheme requires handshake for stretch bound to work...why?
           print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength
           badPaths += 1
@@ -595,7 +684,7 @@ def testWorstCasePaths(store):
       maxStretch = max(maxStretch, stretch)
       checked += 2
   avgStretch /= max(1, checked)
-  print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
+  print "Avg / Max worst-case source-routed stretch: {} / {}".format(avgStretch, maxStretch)
   print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
   return avgStretch, maxStretch, badPaths, checked
 
@@ -612,10 +701,11 @@ def main(store):
   # First print some table size info, since testing paths takes forever
   avgClus, maxClus = getClusterSizes(store)
   # Now test the paths, takes forever, unless you use the worst-case paths only
-  avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # TODO finish testing w/ this
-  #avgStretch, maxStretch, badPaths, checked = testPaths(store)
+  #avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # TODO finish testing w/ this
+  #avgStretch, maxStretch, badPaths, checked = testPathsSourceRouted(store)
+  avgStretch, maxStretch, badPaths, checked = testPaths(store)
   print "Finished testing network"
-  print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
+  print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
   print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
   print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
   return avgStretch, maxStretch, avgClus, maxClus
@@ -646,9 +736,10 @@ def processASRelFiles():
     avgClus, maxClus = getClusterSizes(store)
     avgStretch, maxStretch, badPaths, checked = 0, 0, 0, 0 # In case we skip testing paths, to only check routing table sizes
     #avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # Fast-ish worst-case test
-    #avgStretch, maxStretch, badPaths, checked = testPaths(store) # Comment out to skip, slow
+    #avgStretch, maxStretch, badPaths, checked = testPathsSourceRouted(store) # Comment out to skip, slow
+    avgStretch, maxStretch, badPaths, checked = testPaths(store)
     print "Finished testing network"
-    print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
+    print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
     print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
     print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
     with open(outpath, "w") as f:
