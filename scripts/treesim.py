@@ -3,66 +3,30 @@
 #   1: Pick any node, here I'm using highest nodeID
 #   2: Build spanning tree, each node stores path back to root
 #     Optionally with weights for each hop
-#   3: Keep track of extra shortcuts where the tree stretch is too high
-#   4: Use distance of shortcuts + remaining tree distance as a distance metric
-#   5: Perform (modified) greedy lookup via this metric for each direction (A->B and B->A)
-#   6: Source-route traffic using the shorter/better of those two paths
+#     Ties broken by preferring a parent with higher degree
+#   3: Distance metric: self->peer + (via tree) peer->dest
+#   4: Perform (modified) greedy lookup via this metric for each direction (A->B and B->A)
+#   5: Source-route traffic using the better of those two paths
 
-# Note:
-#   Currently set to do worstCasePathLength lookups instead of the greedy ones
-#   To test if/when max stretch bounds are violated
-#   Switch back to greedy ones to see average stretch in practice (much better)
-
-# TODO
-#   Looping over peers/cluster for the lookup is slow
-#   Pre-compute some table to speed up the lookups
-#     (Mostly go by matching prefix in tree)
-
-# TODO
-#   We keep the smallest amount of info I could find that doesn't break stretch bound
-#   There's an alternative subset of info to store, but it isn't perfect
-#   Keeps much less info, but the stretch bound is violated for some paths
-#   Caused by something like the following:
-#     B->X->D is known by B, B does not care about X
-#     B->C->D also exists, B does care about C
-#     A->B->X->D is long enough that A doesn't care about it
-#     A->B->C is short enough that A would care about it, if A heard
-#   Attempted fix: have B switch to using B->C->D instead of B->X->D
-#   Problem: This caused oscillation in some networks
-#   It's rare for this to be a problem (most paths are fine)
-#   If table size with the normal requirement becomes too high, switch to this
-#     On a node-by-node basis
-#     It will let you drop paths that are unlikely to cause stretch issues
-#   In the long term, figure out the minimum set needed is, just use that
-#     This is probably difficult
-#     Problems come from interactions between nodes, not 1 node's view
-
-# TODO:
-#   Investigate using Peleg's distance labeling scheme for trees (also used in the bc scheme)
-#   That would mean we could drop the path-vector aspects and use hybrid tree+dv
-#   (Probably not compatible with using weighted graphs)
-#   (Harder to secure, but less resource usage, so could be nice for sensor nets)
+# Note: This makes to attempt to simulate a dynamic network
+#   E.g. A node's peers cannot be disconnected
 
 # TODO:
 #   Make better use of drop?
 #   In particular, we should be ignoring *all* recently dropped *paths* to the root
 #     To minimize route flapping
-#     Not really an issue in the sim, but needed for a real network
+#     Not really an issue in the sim, but probably needed for a real network
 
-import random
+import ctypes
+import glob
 import heapq
+import multiprocessing as MP
+import os
+import random
 
 #############
 # Constants #
 #############
-
-# Maximum allowed path length: y = m*x + b
-# y = maximum path length allowed in the scheme
-# x = shortest path length between two nodes in the network
-# m = multiplicative stretch, MAX_MS
-# b = additive stretch, MAX_AS
-MAX_MS = 0
-MAX_AS = 0
 
 # Reminder of where link cost comes in
 LINK_COST = 1
@@ -79,6 +43,7 @@ class PathInfo:
     self.nodeID = nodeID   # e.g. IP
     self.coords = []       # Position in tree
     self.tstamp = 0        # Timestamp from sender, to keep track of old vs new info
+    self.degree = 0        # Number of peers the sender has, used to break ties
     # The above should be signed
     self.path   = [nodeID] # Path to node (in path-vector route)
     self.time   = 0        # Time info was updated, to keep track of e.g. timeouts
@@ -88,6 +53,7 @@ class PathInfo:
     clone.nodeID = self.nodeID
     clone.coords = self.coords[:]
     clone.tstamp = self.tstamp
+    clone.degree = self.degree
     clone.path = self.path[:]
     clone.time = self.time
     return clone
@@ -97,7 +63,6 @@ class Node:
   def __init__(self, nodeID):
     self.info  = PathInfo(nodeID) # Self NodeInfo
     self.root  = None             # PathInfo to node at root of tree
-    self.clus  = dict()           # PathInfo to nodes nearby relative to tree
     self.drop  = dict()           # PathInfo to nodes from clus that have timed out
     self.peers = dict()           # PathInfo to peers
     self.links = dict()           # Links to peers (to pass messages)
@@ -110,15 +75,9 @@ class Node:
       # Update timestamp at least once every 1/4 timeout period
       # This should probably be randomized in a real implementation
       self.info.tstamp = self.info.time
+      self.info.degree = len(self.peers)
     changed = False # Used to track when the network has converged
-    #changed |= self.cleanRoot()
-    if self.cleanRoot():
-      print "DEBUG:", self.info.nodeID, "cleanRoot"
-      changed = True
-    #changed |= self.cleanCluster()
-    if self.cleanCluster():
-      print "DEBUG:", self.info.nodeID, "cleanCluster"
-      changed = True
+    changed |= self.cleanRoot()
     self.cleanDropped()
     # Should probably send messages infrequently if there's nothing new to report
     if self.info.tstamp == self.info.time:
@@ -129,6 +88,7 @@ class Node:
   def cleanRoot(self):
     changed = False
     if self.root and self.info.time - self.root.time > TIMEOUT:
+      print "DEBUG: clean root,", self.root.path
       self.drop[self.root.nodeID] = self.root
       self.root = None
       changed = True
@@ -141,26 +101,6 @@ class Node:
       self.root = self.info.clone()
     return changed
 
-  def cleanCluster(self):
-    changed = False
-    nodes = self.clus.values()
-    for node in nodes:
-      if self.info.time - node.time > TIMEOUT:
-        # Timed out
-        self.drop[node.nodeID] = node
-        del self.clus[node.nodeID]
-        changed = True
-      elif node.coords[0] != self.root.nodeID:
-        # Wrong tree, something's unconverged, wait for that to get fixed first
-        del self.clus[node.nodeID]
-        changed = True
-      elif not self.mustStorePath(node):
-        # The tree route is good enough
-        self.drop[node.nodeID] = node
-        del self.clus[node.nodeID]
-        changed = True
-    return changed
-
   def cleanDropped(self):
     nodes = self.drop.values()
     for node in nodes:
@@ -168,70 +108,17 @@ class Node:
         del self.drop[node.nodeID]
     return None
 
-  def mustStorePath(self, info):
-    if (info.coords[0] != self.info.coords[0]): return False
-    assert(info.path[-1] == self.info.nodeID)
-    tPath = treePath(self.info.coords, info.coords) # DEBUG
-    assert tPath[-1] == self.info.nodeID # DEBUG
-    assert tPath[0] == info.nodeID # DEBUG
-    pathLength = len(info.path)-1 # The last hop is ourself, doesn't count
-    treeLength = treeDist(self.info.coords, info.coords)
-    maxAllowedDist = pathLength*MAX_MS + MAX_AS
-    if not maxAllowedDist:
-      # Special case, set stretch to (0, 0) to keep nothing
-      # To test what stretch is like if you only use neighbor info
-      return False
-    if not maxAllowedDist < treeLength: return False # Stretch is tolerable
-    hasBetterPath = False
-    for nodeID in self.clus: # Possibly sort keys first? (Is oscillation possible?)
-      if nodeID == info.nodeID: continue
-      node = self.clus[nodeID]
-      nodePathLength = len(node.path)-1
-      infoNodeSeparation = treeDist(node.coords, info.coords)
-      maxAllowedDistToNode = nodePathLength*MAX_MS + MAX_AS
-      infoMaxDistViaNode = maxAllowedDistToNode + infoNodeSeparation
-      if infoMaxDistViaNode <= maxAllowedDist:
-        # The worst-case path via node would have tolerable stretch
-        # So we can safely use node as a shortcut to info without stretch issues
-        hasBetterPath = True
-      # TODO find a way to store less info safely (keeping the stretch bound)
-      #   Something involving path lengths? (peers may be special cases...)
-      infoDistViaNode = nodePathLength + infoNodeSeparation
-      nodeDistViaInfo = pathLength + infoNodeSeparation
-      if infoDistViaNode <= maxAllowedDist:
-        # If routing table size becomes too large, then include this check
-        # That's unsafe; stretch is sometimes higher than the set upper bound
-        # But it appears to stay within the stretch bound for most paths
-        # So the smaller tables may be worth the slight break of the stretch bound
-        #   At least until a better rule can be found
-        # This should be done in addition to the usual (safe) check
-        nodeTreeLength = treeDist(self.info.coords, node.coords)
-        if treeLength <= nodeTreeLength and nodePathLength <= pathLength:
-          # It's likely that node and info would both work as shortcuts
-          # A shortcut to a distant part of the tree is more valuable
-          # As is a shortcut to a closer node in network space
-          # FIXME oscillates in 2+4 32x32 network, seed 12345
-          # Or any network with MAX_MS == 2?
-          hasBetterPath = True
-    if not hasBetterPath: return True
-    return False
-
   def createMessage(self):
-    # Message is just a list
+    # Message is just a tuple
     # First element in the list is always the sender
     # Second element is the root
-    # The rest are cluster nodes, in no particular order
     # We will .clone() everything during the send operation
-    msg = []
-    msg.append(self.info)
-    msg.append(self.root)
-    for node in self.clus.values():
-      msg.append(node)
+    msg = (self.info, self.root)
     return msg
 
   def sendMessage(self, msg):
     for link in self.links.values():
-      newMsg = map(lambda info: info.clone(), msg)
+      newMsg = (msg[0].clone(), msg[1].clone())
       link.msgs.append(newMsg)
     return None
 
@@ -244,102 +131,63 @@ class Node:
   def handleMessage(self, msg):
     changed = False
     for node in msg:
-      if self.info.nodeID in node.path: continue # Loopy route
+      # Update the path and timestamp for the sender and root info
       node.path.append(self.info.nodeID)
       node.time = self.info.time
-      assert node.path[-1] == self.info.nodeID
-      if node.nodeID in self.drop:
-        if node.tstamp <= self.drop[node.nodeID].tstamp:
-          # This is old, skip it
-          continue
-        else:
-          # It's new
-          pass
-      if not self.mustStorePath(node):
-        # The tree route is good enough
-        continue
-      updateNode = False
-      if not node.nodeID in self.clus:
-        updateNode = True
-        changed = True
-      else:
-        if node.path == self.clus[node.nodeID].path:
-          self.clus[node.nodeID] = node
-        if len(node.path) < len(self.clus[node.nodeID].path):
-          self.clus[node.nodeID] = node
-          changed = True
-      if updateNode:
-        self.clus[node.nodeID] = node
-        if node.nodeID in self.drop: del self.drop[node.nodeID]
+    # Update the sender's info in our list of peers
     sender = msg[0]
-    assert sender.time == self.info.time
     self.peers[sender.nodeID] = sender
-    root = msg[1]
-    assert root.time == self.info.time or self.info.nodeID in root.path
     # Decide if we want to update the root
+    root = msg[1]
     updateRoot = False
-    if root.nodeID in self.drop and self.drop[root.nodeID].tstamp >= root.tstamp: pass
+    isSameParent = False
+    isBetterParent = False
+    if len(self.root.path) > 1 and len(root.path) > 1:
+      parent = self.peers[self.root.path[-2]]
+      if parent.nodeID == sender.nodeID: isSameParent = True
+      if sender.degree > parent.degree:
+        # This would also be where you check path uptime/reliability/whatever
+        # All else being equal, we prefer parents with high degree
+        # We are trusting peers to report degree correctly in this case
+        # So expect some performance reduction if your peers aren't trustworthy
+        # (Lies can increase average stretch by a few %)
+        isBetterParent = True
+      if sender.degree == parent.degree and len(root.path) < len(self.root.path):
+        isBetterParent = True
+    if self.info.nodeID in root.path[:-1]: pass # No loopy routes allowed
+    elif root.nodeID in self.drop and self.drop[root.nodeID].tstamp >= root.tstamp: pass
     elif not self.root: updateRoot = True
     elif self.root.nodeID < root.nodeID: updateRoot = True
     elif self.root.nodeID != root.nodeID: pass
     elif self.root.tstamp > root.tstamp: pass
     elif len(root.path) < len(self.root.path): updateRoot = True
-    # TODO case where current path missed at least 1 update
-    # (Without it, we wait for the path to time out)
-    elif self.root.path != root.path: pass
-    elif self.root.tstamp < root.tstamp: updateRoot = True
+    elif isBetterParent and len(root.path) == len(self.root.path): updateRoot = True
+    elif isSameParent and self.root.tstamp < root.tstamp: updateRoot = True
     if updateRoot:
       if not self.root or self.root.path != root.path: changed = True
       self.root = root
       self.info.coords = self.root.path
     return changed
 
-  def createLookupCache(self):
-    # Purely to speed up path stretch testing
-    # Eats a lot of memory
-    self.lookupCache = dict()
-    return None
-
   def lookup(self, dest):
-    if hasattr(self, 'lookupCache') and dest.nodeID in self.lookupCache:
-      return self.lookupCache[dest.nodeID]
-    best = self.info
-    bestDist = treeDist(self.info.coords, dest.coords)
-    # <= means we prefer to replace ourself w/ a peer, and a peer w/ a cluster node
-    # That disfavors routing on the tree, which (hopefully) reduces congestion
+    # Note: Can loop in an unconverged network
+    # The person looking up the route is responsible for checking for loops
+    best = None
+    bestDist = 0
     for node in self.peers.itervalues():
+      # dist = distance to node + dist (on tree) from node to dest
       dist = len(node.path)-1 + treeDist(node.coords, dest.coords)
-      if dist <= bestDist:
+      if not best or dist < bestDist:
         best = node
         bestDist = dist
-    for node in self.clus.itervalues():
-      dist = len(node.path)-1 + treeDist(node.coords, dest.coords)
-      if dist <= bestDist:
-        best = node
-        bestDist = dist
-    if best.nodeID != self.info.nodeID:
-      #print "DEBUG BEST:", self.info.nodeID, best.path[::-1]
+    if best:
       next = best.path[-2]
+      assert next in self.peers
+      return next
     else:
-      tPath = treePath(self.info.coords, dest.coords)
-      #print "DEBUG TREE:", self.info.nodeID, tPath
-      next = tPath[-2]
-    assert next in self.peers
-    if hasattr(self, 'lookupCache'): self.lookupCache[dest.nodeID] = next
-    return next
-
-  def getWorstCasePathLength(self, dest):
-    best = self.info
-    bestDist = treeDist(self.info.coords, dest.coords)
-    # <= means we prefer to replace ourself w/ a peer, and a peer w/ a cluster node
-    # That disfavors routing on the tree, which (hopefully) reduces congestion
-    for node in self.clus.itervalues():
-      dist = len(node.path)-1 + treeDist(node.coords, dest.coords)
-      if dist <= bestDist:
-        best = node
-        bestDist = dist
-    return bestDist
-
+      # We failed to look something up
+      # TODO some way to signal this which doesn't crash
+      assert False
 # End class Node
 
 ####################
@@ -389,16 +237,13 @@ def linkNodes(node1, node2):
   node1.links[node2.info.nodeID] = node2
   node2.links[node1.info.nodeID] = node1
 
-def randomly(seq):
-    shuffled = list(seq)
-    random.shuffle(shuffled)
-    return shuffled
-
 ############################
 # Store topology functions #
 ############################
 
 def makeStoreSquareGrid(sideLength, randomize=True):
+  # Simple grid in a sideLength*sideLength square
+  # Just used to validate that the code runs
   store = dict()
   nodeIDs = list(range(sideLength*sideLength))
   if randomize: random.shuffle(nodeIDs)
@@ -408,30 +253,6 @@ def makeStoreSquareGrid(sideLength, randomize=True):
     if (index % sideLength != 0): linkNodes(store[nodeIDs[index]], store[nodeIDs[index-1]])
     if (index >= sideLength): linkNodes(store[nodeIDs[index]], store[nodeIDs[index-sideLength]])
   print "Grid store created, size {}".format(len(store))
-  return store
-
-def makeStoreRing(nodeCount, randomize=True):
-  store = dict()
-  nodeIDs = list(range(nodeCount))
-  if randomize: random.shuffle(nodeIDs)
-  for nodeID in nodeIDs:
-    store[nodeID] = Node(nodeID)
-  for index in xrange(len(nodeIDs)):
-    linkNodes(store[nodeIDs[index]], store[nodeIDs[index-1]])
-  print "Ring store created, size {}".format(len(store))
-  return store
-
-def makeStoreCaidaGraph(pathToGraph):
-  #Existing network graphs, in caida.org's format (undirected ASx ASy pairs per line)
-  with open(pathToGraph, "r") as f:
-    inData = f.readlines()
-  store = dict()
-  for line in inData:
-    nodes = map(int, line.rstrip('\n').split(' ')[0:2])
-    if nodes[0] not in store: store[nodes[0]] = Node(nodes[0])
-    if nodes[1] not in store: store[nodes[1]] = Node(nodes[1])
-    linkNodes(store[nodes[0]], store[nodes[1]])
-  print "CAIDA graph successfully imported, size {}".format(len(store))
   return store
 
 def makeStoreASRelGraph(pathToGraph):
@@ -448,8 +269,7 @@ def makeStoreASRelGraph(pathToGraph):
   print "CAIDA AS-relation graph successfully imported, size {}".format(len(store))
   return store
 
-def makeStoreASRelGraphMaxDeg(pathToGraph):
-  #Existing network graphs, in caida.org's asrel format (ASx|ASy|z per line, z denotes relationship type)
+def makeStoreASRelGraphMaxDeg(pathToGraph, degIdx=0):
   with open(pathToGraph, "r") as f:
     inData = f.readlines()
   store = dict()
@@ -461,42 +281,55 @@ def makeStoreASRelGraphMaxDeg(pathToGraph):
     if nodes[1] not in nodeDeg: nodeDeg[nodes[1]] = 0
     nodeDeg[nodes[0]] += 1
     nodeDeg[nodes[1]] += 1
-  maxDegNodeID = None
-  maxDeg = 0
-  for nodeID in nodeDeg:
-    deg = nodeDeg[nodeID]
-    if maxDeg < deg:
-      maxDeg = deg
-      maxDegNodeID = nodeID
+  sortedNodes = sorted(nodeDeg.keys(), \
+                       key=lambda x: (nodeDeg[x], x), \
+                       reverse=True)
+  maxDegNodeID = sortedNodes[degIdx]
+  return makeStoreASRelGraphFixedRoot(pathToGraph, maxDegNodeID)
+
+def makeStoreASRelGraphFixedRoot(pathToGraph, rootNodeID):
+  with open(pathToGraph, "r") as f:
+    inData = f.readlines()
+  store = dict()
   for line in inData:
     if line.strip(" ")[0] == "#": continue # Skip comment lines
     nodes = map(int, line.rstrip('\n').split('|')[0:2])
-    if nodes[0] == maxDegNodeID: nodes[0] += 1000000000
-    if nodes[1] == maxDegNodeID: nodes[1] += 1000000000
+    if nodes[0] == rootNodeID: nodes[0] += 1000000000
+    if nodes[1] == rootNodeID: nodes[1] += 1000000000
     if nodes[0] not in store: store[nodes[0]] = Node(nodes[0])
     if nodes[1] not in store: store[nodes[1]] = Node(nodes[1])
     linkNodes(store[nodes[0]], store[nodes[1]])
   print "CAIDA AS-relation graph successfully imported, size {}".format(len(store))
   return store
 
-def makeStoreHypeGraph(pathToGraph):
-  # Expects the format found in http://www.fc00.org/static/graph.json
-  import json
-  with open(pathToGraph, "r") as f:
-    inData = json.loads(f.read())
+def makeStoreDimesEdges(pathToGraph, rootNodeID=None):
+  # Read from a DIMES csv-formatted graph
+  index = 0
   store = dict()
-  for edge in inData[u'edges']:
-    sourceID = str(edge[u'sourceID'])
-    destID = str(edge[u'targetID'])
-    if sourceID not in store: store[sourceID] = Node(sourceID)
-    if destID not in store: store[destID] = Node(destID)
-    if destID not in store[sourceID].links: linkNodes(store[sourceID], store[destID])
-  print "Hyperboria graph successfully imported, size {}".format(len(store))
+  size = os.path.getsize(pathToGraph)
+  with open(pathToGraph, "r") as f:
+    index = 0
+    for edge in f:
+      if not index % 1000:
+        pos = f.tell()
+        pct = 100.0*pos/size
+        print "Processing edge {}, {:.2f}%".format(index, pct)
+      index += 1
+      dat = edge.rstrip('\n').split(',')
+      node1 = "N" + str(dat[0])
+      node2 = "N" + str(dat[1])
+      if '?' in node1 or '?' in node2: continue
+      if node1 == rootNodeID: node1 = "R" + str(dat[0])
+      if node2 == rootNodeID: node2 = "R" + str(dat[1])
+      if node1 not in store: store[node1] = Node(node1)
+      if node2 not in store: store[node2] = Node(node2)
+      if node1 != node2: linkNodes(store[node1], store[node2])
+  print "DIMES graph successfully imported, size {}".format(len(store))
   return store
 
-##########################
-# Network Test Functions #
-##########################
+############################################
+# Functions used as parts of network tests #
+############################################
 
 def idleUntilConverged(store):
   nodeIDs = sorted(store.keys())
@@ -516,208 +349,196 @@ def idleUntilConverged(store):
     if changed: timeOfLastChange = step
   return store
   
-def getClusterSizes(store):
-  avgClus = 0.0
-  maxClus = 0.0
-  for node in store.itervalues():
-    clus = len(node.clus)
-    avgClus += clus
-    maxClus = max(maxClus, clus)
-  avgClus /= len(store)
-  print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
-  return avgClus, maxClus
+def getCacheIndex(nodes, sourceIndex, destIndex):
+  return sourceIndex*nodes + destIndex
 
-def testPathsSourceRouted(store):
-  for node in store.itervalues():
-    # Use a LOT more memory to run the tests faster
-    node.createLookupCache()
+def compactPathCacheWorker(store, cache, processNum, processTotal):
   nodeIDs = sorted(store.keys())
-  maxStretch = 0.0
-  avgStretch = 0.0
-  maxStretchNoSource = 0.0
-  avgStretchNoSource = 0.0
-  checked = 0
-  nodesChecked = 0
-  badPaths = 0
-  for sourceID in nodeIDs:
-    nodesChecked += 1
-    clus = len(store[sourceID].clus)
-    print "Testing paths from node {} / {} ({}) ({})".format(nodesChecked, len(nodeIDs), sourceID, clus)
+  nNodes = len(nodeIDs)
+  nodeIdxs = dict()
+  for nodeIdx in xrange(nNodes):
+    nodeIdxs[nodeIDs[nodeIdx]] = nodeIdx
+  for sourceIdx in xrange(nNodes):
+    if sourceIdx % processTotal != processNum: continue # Not our work to do
+    sourceID = nodeIDs[sourceIdx]
+    print "Building fast lookup table for node {} / {} ({})".format(sourceIdx+1, nNodes, sourceID)
+    for destIdx in xrange(nNodes):
+      destID = nodeIDs[destIdx]
+      if sourceID == destID: nextHop = destID # lookup would fail
+      else: nextHop = store[sourceID].lookup(store[destID].info)
+      nextHopIdx = nodeIdxs[nextHop]
+      cache[getCacheIndex(nNodes, sourceIdx, destIdx)] = nextHopIdx
+  return
+
+def getCompactPathCache(store, processTotal=1):
+  nodeIDs = sorted(store.keys())
+  nNodes = len(nodeIDs)
+  nodeIdxs = dict()
+  for nodeIdx in xrange(nNodes):
+    nodeIdxs[nodeIDs[nodeIdx]] = nodeIdx
+  cache = MP.RawArray(ctypes.c_ushort, nNodes*nNodes)
+  children = []
+  for processNum in xrange(processTotal):
+    print "Creating worker {} / {}".format(processNum+1, processTotal)
+    q = MP.Queue()
+    p = MP.Process(target=compactPathCacheWorker, args=(store, cache, processNum, processTotal))
+    children.append(p)
+  for child in children: child.start() # Launch child processes
+  for child in children: child.join()  # Wait for children to finish
+  return cache
+
+def pathTestWorker(store, cache, output, processNum, processTotal):
+  nodeIDs = sorted(store.keys())
+  nNodes = len(nodeIDs)
+  idxs = dict()
+  for nodeIdx in xrange(nNodes):
+    nodeID = nodeIDs[nodeIdx]
+    idxs[nodeID] = nodeIdx
+  results = dict()
+  for sourceIdx in xrange(nNodes):
+    if sourceIdx % processTotal != processNum: continue # Not our work to do
+    sourceID = nodeIDs[sourceIdx]
+    print "Testing paths from node {} / {} ({})".format(sourceIdx+1, len(nodeIDs), sourceID)
     expected = dijkstra(store, sourceID)
-    for destID in nodeIDs:
-      if destID <= sourceID: continue # No point in testing path to self, or retesting an already tested path
+    for destIdx in xrange(sourceIdx+1, nNodes):
+      destID = nodeIDs[destIdx]
+      if destID <= sourceID: continue # Skip anything we've already checked
       if destID not in expected: continue # The network is split, no path exists
       eHops = expected[destID]
-      maxAllowedLength = eHops*MAX_MS + MAX_AS
       hops = 0
-      for pair in (sourceID, destID), (destID, sourceID):
-        sourceInfo = store[pair[0]].info
-        destInfo = store[pair[1]].info
-        loc = sourceInfo.nodeID
-        path = [loc]
-        while loc != destInfo.nodeID:
-          next = store[loc].lookup(destInfo)
-          if next in path:
-            print "ROUTING LOOP!"
-            print sourceInfo.nodeID, sourceInfo.coords, destInfo.nodeID, destInfo.coords, loc, next, path
-            #return store # Debug it
-            #assert False
-            break
-          loc = next
-          path.append(loc)
-        nHops = len(path)-1
-        stretchNoSource = float(nHops)/max(1, eHops)
-        avgStretchNoSource += stretchNoSource
-        maxStretchNoSource = max(maxStretchNoSource, stretchNoSource)
-        if nHops > maxAllowedLength and maxAllowedLength:
-          print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
-          #return store # Debug it
-          #assert False
-          badPaths += 1
+      for pair in (sourceIdx, destIdx), (destIdx, sourceIdx):
+        sourceInfo = store[nodeIDs[pair[0]]].info
+        destInfo = store[nodeIDs[pair[1]]].info
+        locIdx = idxs[sourceInfo.nodeID] # Get the index of our current position
+        nHops = 0
+        dIdx = idxs[destInfo.nodeID] # Get the index of the destination
+        while locIdx != dIdx:
+          locIdx = cache[getCacheIndex(nNodes, locIdx, dIdx)]
+          nHops += 1
         if not hops or nHops < hops: hops = nHops
-      stretch = float(hops)/max(1, eHops)
-      avgStretch += 2*stretch
-      maxStretch = max(maxStretch, stretch)
-      checked += 2
-    timeToClean = not nodesChecked % 1000 #int(len(nodeIDs)**0.5)
-    for node in store.itervalues():
-      if hasattr(node, 'lookupCache'):
-        if timeToClean:
-          # DEBUG, keep mem usage down by cleaning everything periodically
-          node.lookupCache.clear()
-        if sourceID in node.lookupCache:
-          # We'll never need this again, so clean it up
-          del node.lookupCache[sourceID]
+      if eHops not in results: results[eHops] = dict()
+      if hops not in results[eHops]: results[eHops][hops] = 0
+      results[eHops][hops] += 2 # Once for source->dest, once for dest->source
+  output.put(results)
+
+def testPaths(store, processTotal=1):
+  #cache = getCompactPathCache(store, processTotal)
+  # Temporarily running with just 1 worker
+  # This part is relatively quick, and 1 worker gives the CPU a chance to cool a bit
+  # (Most relevant when running many tests over many networks in series)
+  cache = getCompactPathCache(store)
+  children = []
+  pathMatrices = []
+  for processNum in xrange(processTotal):
+    print "Creating worker {} / {}".format(processNum+1, processTotal)
+    q = MP.Queue()
+    p = MP.Process(target=pathTestWorker, args=(store, cache, q, processNum, processTotal))
+    children.append(p)
+    pathMatrices.append(q)
+  for child in children: child.start()
+  for child in children: child.join()
+  print "Workers finished."
+  pathMatrix = dict()
+  for q in pathMatrices:
+    pm = q.get()
+    for eHops in pm:
+      if eHops not in pathMatrix: pathMatrix[eHops] = dict()
+      for nHops in pm[eHops]:
+        if nHops not in pathMatrix[eHops]: pathMatrix[eHops][nHops] = 0
+        pathMatrix[eHops][nHops] += pm[eHops][nHops]
+  return pathMatrix
+
+def getAvgStretch(pathMatrix):
+  avgStretch = 0.
+  checked = 0.
+  for eHops in sorted(pathMatrix.keys()):
+    for nHops in sorted(pathMatrix[eHops].keys()):
+      count = pathMatrix[eHops][nHops]
+      stretch = float(nHops)/float(max(1, eHops))
+      avgStretch += stretch*count
+      checked += count
   avgStretch /= max(1, checked)
-  avgStretchNoSource /= max(1, checked)
-  print "Avg / Max source-routed stretch: {} / {}".format(avgStretch, maxStretch)
-  print "Avg / Max normal-routed stretch: {} / {}".format(avgStretchNoSource, maxStretchNoSource)
-  print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
-  return avgStretch, maxStretch, badPaths, checked
+  return avgStretch
 
-def testPaths(store):
-  for node in store.itervalues():
-    node.createLookupCache()
-  nodeIDs = sorted(store.keys())
-  maxStretchNoSource = 0.0
-  avgStretchNoSource = 0.0
-  checked = 0
-  nodesChecked = 0
-  badPaths = 0
-  for destID in nodeIDs:
-    nodesChecked += 1
-    clus = len(store[destID].clus)
-    print "Testing paths to node {} / {} ({}) ({})".format(nodesChecked, len(nodeIDs), destID, clus)
-    expected = dijkstra(store, destID)
-    for sourceID in nodeIDs:
-      if sourceID == destID: continue # No point in testing path to self, or retesting an already tested path
-      if sourceID not in expected: continue # The network is split, no path exists
-      eHops = expected[sourceID]
-      maxAllowedLength = eHops*MAX_MS + MAX_AS
-      hops = 0
-      sourceInfo = store[sourceID].info
-      destInfo = store[destID].info
-      loc = sourceInfo.nodeID
-      path = [loc]
-      while loc != destInfo.nodeID:
-        next = store[loc].lookup(destInfo)
-        if next in path:
-          print "ROUTING LOOP!"
-          print sourceInfo.nodeID, sourceInfo.coords, destInfo.nodeID, destInfo.coords, loc, next, path
-          #return store # Debug it
-          #assert False
-          break
-        loc = next
-        path.append(loc)
-      nHops = len(path)-1
-      if nHops > maxAllowedLength and maxAllowedLength:
-        print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength, path
-        #return store # Debug it
-        #assert False
-        badPaths += 1
-      stretchNoSource = float(nHops)/max(1, eHops)
-      avgStretchNoSource += stretchNoSource
-      maxStretchNoSource = max(maxStretchNoSource, stretchNoSource)
-      checked += 1
-    for node in store.itervalues():
-      if hasattr(node, 'lookupCache'):
-        node.lookupCache.clear()
-  avgStretchNoSource /= max(1, checked)
-  print "Avg / Max normal-routed stretch: {} / {}".format(avgStretchNoSource, maxStretchNoSource)
-  print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
-  return avgStretchNoSource, maxStretchNoSource, badPaths, checked
-
-def testWorstCasePaths(store):
-  # This version checks the lengths of the path according to each node's store
-  # This is the thing that must satisfy our stretch bound, not the path actually taken
-  # (Which will often be much shorter)
-  nodeIDs = sorted(store.keys())
-  maxStretch = 0.0
-  avgStretch = 0.0
-  checked = 0
-  nodesChecked = 0
-  badPaths = 0
-  for sourceID in nodeIDs:
-    nodesChecked += 1
-    clus = len(store[sourceID].clus)
-    print "Testing paths from node {} / {} ({}) ({})".format(nodesChecked, len(nodeIDs), sourceID, clus)
-    expected = dijkstra(store, sourceID)
-    for destID in nodeIDs:
-      if destID <= sourceID: continue # No point in testing path to self, or retesting an already tested path
-      if destID not in expected: continue # The network is split, no path exists
-      eHops = expected[destID]
-      maxAllowedLength = eHops*MAX_MS + MAX_AS
-      hops = 0
-      for pair in (sourceID, destID), (destID, sourceID):
-        sourceInfo = store[pair[0]].info
-        destInfo = store[pair[1]].info
-        nHops = store[sourceInfo.nodeID].getWorstCasePathLength(destInfo)
-        if nHops > maxAllowedLength and maxAllowedLength:
-          # Disregard, new scheme requires handshake for stretch bound to work...why?
-          print "EXCEEDED MAX ALLOWED PATH LENGTH:", sourceInfo.nodeID, destInfo.nodeID, nHops, maxAllowedLength
-          badPaths += 1
-          #return store # Debug it
-          #assert False
-        if not hops or nHops < hops: hops = nHops
-      stretch = float(hops)/max(1, eHops)
-      avgStretch += 2*stretch
+def getMaxStretch(pathMatrix):
+  maxStretch = 0.
+  for eHops in sorted(pathMatrix.keys()):
+    for nHops in sorted(pathMatrix[eHops].keys()):
+      stretch = float(nHops)/float(max(1, eHops))
       maxStretch = max(maxStretch, stretch)
-      checked += 2
-  avgStretch /= max(1, checked)
-  print "Avg / Max worst-case source-routed stretch: {} / {}".format(avgStretch, maxStretch)
-  print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
-  return avgStretch, maxStretch, badPaths, checked
+  return maxStretch
 
-##################
-# Main execution #
-##################
+def getResults(pathMatrix):
+  results = []
+  for eHops in sorted(pathMatrix.keys()):
+    for nHops in sorted(pathMatrix[eHops].keys()):
+      count = pathMatrix[eHops][nHops]
+      results.append("{} {} {}".format(eHops, nHops, count))
+  return '\n'.join(results)
 
-def main(store):
+####################################
+# Functions to run different tests #
+####################################
+
+def runTest(store, processTotal=1):
+  # Runs the usual set of tests on the store
+  # Does not save results, so only meant for quick tests
+  # To e.g. check the code works, maybe warm up the pypy jit
   for node in store.values():
     node.info.time = random.randint(0, TIMEOUT)
     node.info.tstamp = TIMEOUT
   print "Begin testing network"
   idleUntilConverged(store)
-  # First print some table size info, since testing paths takes forever
-  avgClus, maxClus = getClusterSizes(store)
-  # Now test the paths, takes forever, unless you use the worst-case paths only
-  #avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # TODO finish testing w/ this
-  #avgStretch, maxStretch, badPaths, checked = testPathsSourceRouted(store)
-  avgStretch, maxStretch, badPaths, checked = testPaths(store)
+  pathMatrix = testPaths(store, processTotal)
+  avgStretch = getAvgStretch(pathMatrix)
+  maxStretch = getMaxStretch(pathMatrix)
   print "Finished testing network"
   print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
-  print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
-  print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
-  return avgStretch, maxStretch, avgClus, maxClus
+  return # End of function
 
-def processASRelFiles():
-  # Like main, but saves final results to disk
-  import glob
-  import os
-  paths = sorted(glob.glob("asrel/datasets/*"))
-  outDir = "output-treesim"
+def rootNodeASTest(path, processTotal=1):
+  # Checks performance for every possible choice of root node
+  # Saves output for each root node to a separate file on disk
+  # path = input path to some caida.org formatted AS-relationship graph
+  # processTotal = number of processes to run in parallel
+  outDir = "output-treesim-AS"
   if not os.path.exists(outDir): os.makedirs(outDir)
   assert os.path.exists(outDir)
+  exists = sorted(glob.glob(outDir+"/*"))
+  store = makeStoreASRelGraph(path)
+  nodes = sorted(store.keys())
+  for nodeIdx in xrange(len(nodes)):
+    rootNodeID = nodes[nodeIdx]
+    outpath = outDir+"/{}".format(rootNodeID)
+    if outpath in exists:
+      print "Skipping {}, already processed".format(rootNodeID)
+      continue
+    store = makeStoreASRelGraphFixedRoot(path, rootNodeID)
+    for node in store.values():
+      node.info.time = random.randint(0, TIMEOUT)
+      node.info.tstamp = TIMEOUT
+    print "Beginning {}, size {}".format(nodeIdx, len(store))
+    idleUntilConverged(store)
+    pathMatrix = testPaths(store, processTotal)
+    avgStretch = getAvgStretch(pathMatrix)
+    maxStretch = getMaxStretch(pathMatrix)
+    results = getResults(pathMatrix)
+    with open(outpath, "w") as f:
+      f.write(results)
+    print "Finished test for root AS {} ({} / {})".format(rootNodeID, nodeIdx+1, len(store))
+    print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
+    #break # Stop after 1, because they can take forever
+  return # End of function
+
+def timelineASTest(processTotal=1):
+  # Meant to study the performance of the network as a function of network size
+  # Loops over a set of AS-relationship graphs
+  # Runs a test on each graph, selecting highest-degree node as the root
+  # Saves results for each graph to a separate file on disk
+  outDir = "output-treesim-timeline-AS"
+  if not os.path.exists(outDir): os.makedirs(outDir)
+  assert os.path.exists(outDir)
+  paths = sorted(glob.glob("asrel/datasets/*"))
   exists = sorted(glob.glob(outDir+"/*"))
   for path in paths:
     date = os.path.basename(path).split(".")[0]
@@ -725,37 +546,36 @@ def processASRelFiles():
     if outpath in exists:
       print "Skipping {}, already processed".format(date)
       continue
-    #store = makeStoreASRelGraph(path)
     store = makeStoreASRelGraphMaxDeg(path)
     for node in store.values():
       node.info.time = random.randint(0, TIMEOUT)
       node.info.tstamp = TIMEOUT
     print "Beginning {}, size {}".format(date, len(store))
-    # Main takes too long, just idle and get cluster sizes
     idleUntilConverged(store)
-    avgClus, maxClus = getClusterSizes(store)
-    avgStretch, maxStretch, badPaths, checked = 0, 0, 0, 0 # In case we skip testing paths, to only check routing table sizes
-    #avgStretch, maxStretch, badPaths, checked = testWorstCasePaths(store) # Fast-ish worst-case test
-    #avgStretch, maxStretch, badPaths, checked = testPathsSourceRouted(store) # Comment out to skip, slow
-    avgStretch, maxStretch, badPaths, checked = testPaths(store)
-    print "Finished testing network"
-    print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
-    print "Bad / Total paths: {} / {} ({}%)".format(badPaths, checked, 100.0*badPaths/max(1, checked))
-    print "Avg / Max cluster sizes: {} / {}".format(avgClus, maxClus)
+    pathMatrix = testPaths(store, processTotal)
+    avgStretch = getAvgStretch(pathMatrix)
+    maxStretch = getMaxStretch(pathMatrix)
+    results = getResults(pathMatrix)
     with open(outpath, "w") as f:
-      results = "{}, {}, {}, {}, {}, {}, {}".format(len(store), avgClus, maxClus, avgStretch, maxStretch, badPaths, checked)
       f.write(results)
     print "Finished {} with {} nodes".format(date, len(store))
-    break # Stop after 1, because they can take forever
+    print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
+    #break # Stop after 1, because they can take forever
+  return # End of function
+
+##################
+# Main Execution #
+##################
 
 if __name__ == "__main__":
-  random.seed(12345) # DEBUG
-  store = dict()
-  #store = makeStoreSquareGrid(8)
-  #store = makeStoreRing(64)
-  #store = makeStoreHypeGraph("graph.json") # See: http://www.fc00.org/static/graph.json
-  #store = makeStoreCaidaGraph("skitter") # Internet AS graph, from skitter
-  #store = makeStoreASRelGraph("asrel/datasets/19980101.as-rel.txt")
-  if store: main(store)
-  else: processASRelFiles()
+  cpus = MP.cpu_count()
+  if True: # Run a quick test
+    random.seed(12345) # DEBUG
+    store = makeStoreSquareGrid(4)
+    runTest(store, 1) # Quick test, 1 worker process
+  # Do some real work
+  #runTest(makeStoreDimesEdges("../../datasets/DIMES/ASEdges1_2007.csv"), cpus)
+  #rootNodeASTest("asrel/datasets/19980101.as-rel.txt", cpus)
+  #timelineASTest(cpus)
+  rootNodeASTest("hype-rel.links", cpus)
 
