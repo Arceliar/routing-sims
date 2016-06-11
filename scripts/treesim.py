@@ -8,7 +8,7 @@
 #   4: Perform (modified) greedy lookup via this metric for each direction (A->B and B->A)
 #   5: Source-route traffic using the better of those two paths
 
-# Note: This makes to attempt to simulate a dynamic network
+# Note: This makes no attempt to simulate a dynamic network
 #   E.g. A node's peers cannot be disconnected
 
 # TODO:
@@ -18,11 +18,14 @@
 #     Not really an issue in the sim, but probably needed for a real network
 
 import ctypes
+import gc
 import glob
+import gzip
 import heapq
 import multiprocessing as MP
 import os
 import random
+import time
 
 #############
 # Constants #
@@ -152,8 +155,6 @@ class Node:
         # So expect some performance reduction if your peers aren't trustworthy
         # (Lies can increase average stretch by a few %)
         isBetterParent = True
-      if sender.degree == parent.degree and len(root.path) < len(self.root.path):
-        isBetterParent = True
     if self.info.nodeID in root.path[:-1]: pass # No loopy routes allowed
     elif root.nodeID in self.drop and self.drop[root.nodeID].tstamp >= root.tstamp: pass
     elif not self.root: updateRoot = True
@@ -261,8 +262,9 @@ def makeStoreASRelGraph(pathToGraph):
     inData = f.readlines()
   store = dict()
   for line in inData:
-    if line.strip(" ")[0] == "#": continue # Skip comment lines
-    nodes = map(int, line.rstrip('\n').split('|')[0:2])
+    if line.strip()[0] == "#": continue # Skip comment lines
+    line.replace('|'," ")
+    nodes = map(int, line.split()[0:2])
     if nodes[0] not in store: store[nodes[0]] = Node(nodes[0])
     if nodes[1] not in store: store[nodes[1]] = Node(nodes[1])
     linkNodes(store[nodes[0]], store[nodes[1]])
@@ -275,8 +277,9 @@ def makeStoreASRelGraphMaxDeg(pathToGraph, degIdx=0):
   store = dict()
   nodeDeg = dict()
   for line in inData:
-    if line.strip(" ")[0] == "#": continue # Skip comment lines
-    nodes = map(int, line.rstrip('\n').split('|')[0:2])
+    if line.strip()[0] == "#": continue # Skip comment lines
+    line.replace('|'," ")
+    nodes = map(int, line.split()[0:2])
     if nodes[0] not in nodeDeg: nodeDeg[nodes[0]] = 0
     if nodes[1] not in nodeDeg: nodeDeg[nodes[1]] = 0
     nodeDeg[nodes[0]] += 1
@@ -292,8 +295,9 @@ def makeStoreASRelGraphFixedRoot(pathToGraph, rootNodeID):
     inData = f.readlines()
   store = dict()
   for line in inData:
-    if line.strip(" ")[0] == "#": continue # Skip comment lines
-    nodes = map(int, line.rstrip('\n').split('|')[0:2])
+    if line.strip()[0] == "#": continue # Skip comment lines
+    line.replace('|'," ")
+    nodes = map(int, line.split()[0:2])
     if nodes[0] == rootNodeID: nodes[0] += 1000000000
     if nodes[1] == rootNodeID: nodes[1] += 1000000000
     if nodes[0] not in store: store[nodes[0]] = Node(nodes[0])
@@ -303,29 +307,46 @@ def makeStoreASRelGraphFixedRoot(pathToGraph, rootNodeID):
   return store
 
 def makeStoreDimesEdges(pathToGraph, rootNodeID=None):
-  # Read from a DIMES csv-formatted graph
-  index = 0
+  # Read from a DIMES csv-formatted graph from a gzip file
   store = dict()
-  size = os.path.getsize(pathToGraph)
-  with open(pathToGraph, "r") as f:
-    index = 0
-    for edge in f:
-      if not index % 1000:
-        pos = f.tell()
-        pct = 100.0*pos/size
-        print "Processing edge {}, {:.2f}%".format(index, pct)
-      index += 1
-      dat = edge.rstrip('\n').split(',')
-      node1 = "N" + str(dat[0])
-      node2 = "N" + str(dat[1])
-      if '?' in node1 or '?' in node2: continue
-      if node1 == rootNodeID: node1 = "R" + str(dat[0])
-      if node2 == rootNodeID: node2 = "R" + str(dat[1])
-      if node1 not in store: store[node1] = Node(node1)
-      if node2 not in store: store[node2] = Node(node2)
-      if node1 != node2: linkNodes(store[node1], store[node2])
+  with gzip.open(pathToGraph, "r") as f:
+    inData = f.readlines()
+  size = len(inData)
+  index = 0
+  for edge in inData:
+    if not index % 1000:
+      pct = 100.0*index/size
+      print "Processing edge {}, {:.2f}%".format(index, pct)
+    index += 1
+    dat = edge.rstrip().split(',')
+    node1 = "N" + str(dat[0].strip())
+    node2 = "N" + str(dat[1].strip())
+    if '?' in node1 or '?' in node2: continue #Unknown node
+    if node1 == rootNodeID: node1 = "R" + str(dat[0].strip())
+    if node2 == rootNodeID: node2 = "R" + str(dat[1].strip())
+    if node1 not in store: store[node1] = Node(node1)
+    if node2 not in store: store[node2] = Node(node2)
+    if node1 != node2: linkNodes(store[node1], store[node2])
   print "DIMES graph successfully imported, size {}".format(len(store))
   return store
+
+def makeStoreGeneratedGraph(pathToGraph, root=None):
+  with open(pathToGraph, "r") as f:
+    inData = f.readlines()
+  store = dict()
+  for line in inData:
+    if line.strip()[0] == "#": continue # Skip comment lines
+    nodes = map(int, line.strip().split(' ')[0:2])
+    node1 = nodes[0]
+    node2 = nodes[1]
+    if node1 == root: node1 += 1000000
+    if node2 == root: node2 += 1000000
+    if node1 not in store: store[node1] = Node(node1)
+    if node2 not in store: store[node2] = Node(node2)
+    linkNodes(store[node1], store[node2])
+  print "Generated graph successfully imported, size {}".format(len(store))
+  return store
+
 
 ############################################
 # Functions used as parts of network tests #
@@ -388,6 +409,10 @@ def getCompactPathCache(store, processTotal=1):
   return cache
 
 def pathTestWorker(store, cache, output, processNum, processTotal):
+  # TODO remove the store from this...
+  # Technically I think just the cache is good enough
+  # Since we don't care about *who* a node is, just their index in nodeIDs
+  # And that means we don't even need to know nodeIDs, just how they map onto cache
   nodeIDs = sorted(store.keys())
   nNodes = len(nodeIDs)
   idxs = dict()
@@ -422,11 +447,11 @@ def pathTestWorker(store, cache, output, processNum, processTotal):
   output.put(results)
 
 def testPaths(store, processTotal=1):
-  #cache = getCompactPathCache(store, processTotal)
+  cache = getCompactPathCache(store, processTotal)
   # Temporarily running with just 1 worker
   # This part is relatively quick, and 1 worker gives the CPU a chance to cool a bit
   # (Most relevant when running many tests over many networks in series)
-  cache = getCompactPathCache(store)
+  #cache = getCompactPathCache(store)
   children = []
   pathMatrices = []
   for processNum in xrange(processTotal):
@@ -468,6 +493,108 @@ def getMaxStretch(pathMatrix):
       maxStretch = max(maxStretch, stretch)
   return maxStretch
 
+def getCertSizes(store):
+  # Returns nCerts frequency distribution
+  # De-duplicates common certs (for shared prefixes in the path)
+  sizes = dict()
+  for node in store.values():
+    certs = set()
+    for peer in node.peers.values():
+      pCerts = set()
+      assert len(peer.path) == 2
+      assert peer.coords[-1] == peer.path[0]
+      hops = peer.coords + peer.path[1:]
+      for hopIdx in xrange(len(hops)-1):
+        send = hops[hopIdx]
+        if send == node.info.nodeID: continue # We created it, already have it
+        path = hops[0:hopIdx+2]
+        # Each cert is signed by the sender
+        # Includes information about the path from the sender to the next hop
+        # Next hop is at hopIdx+1, so the path to next hop is hops[0:hopIdx+2]
+        cert = "{}:{}".format(send, path)
+        certs.add(cert)
+    size = len(certs)
+    if size not in sizes: sizes[size] = 0
+    sizes[size] += 1
+  return sizes
+
+def getMinLinkCertSizes(store):
+  # Returns nCerts frequency distribution
+  # De-duplicates common certs (for shared prefixes in the path)
+  # Based on the minimum number of certs that must be traded through a particular link
+  # Handled per link
+  sizes = dict()
+  for node in store.values():
+    peerCerts = dict()
+    for peer in node.peers.values():
+      pCerts = set()
+      assert len(peer.path) == 2
+      assert peer.coords[-1] == peer.path[0]
+      hops = peer.coords + peer.path[1:]
+      for hopIdx in xrange(len(hops)-1):
+        send = hops[hopIdx]
+        if send == node.info.nodeID: continue # We created it, already have it
+        path = hops[0:hopIdx+2]
+        # Each cert is signed by the sender
+        # Includes information about the path from the sender to the next hop
+        # Next hop is at hopIdx+1, so the path to next hop is hops[0:hopIdx+2]
+        cert = "{}:{}".format(send, path)
+        pCerts.add(cert)
+      peerCerts[peer.nodeID] = pCerts
+    for peer in peerCerts:
+      size = 0
+      pCerts = peerCerts[peer]
+      for cert in pCerts:
+        required = True
+        for p2 in peerCerts:
+          if p2 == peer: continue
+          p2Certs = peerCerts[p2]
+          if cert in p2Certs: required = False
+        if required: size += 1
+      if size not in sizes: sizes[size] = 0
+      sizes[size] += 1
+  return sizes
+
+def getPathSizes(store):
+  # Returns frequency distribution of the total number of hops the routing table
+  # I.e. a node with 3 peers, each with 5 hop coord+path, would count as 3x5=15
+  sizes = dict()
+  for node in store.values():
+    size = 0
+    for peer in node.peers.values():
+      assert len(peer.path) == 2
+      assert peer.coords[-1] == peer.path[0]
+      peerSize = len(peer.coords) + len(peer.path) - 1 # double-counts peer, -1
+      size += peerSize
+    if size not in sizes: sizes[size] = 0
+    sizes[size] += 1
+  return sizes
+
+def getPeerSizes(store):
+  # Returns frequency distribution of the number of peers each node has
+  sizes = dict()
+  for node in store.values():
+    nPeers = len(node.peers)
+    if nPeers not in sizes: sizes[nPeers] = 0
+    sizes[nPeers] += 1
+  return sizes
+
+def getAvgSize(sizes):
+  sumSizes = 0
+  nNodes = 0
+  for size in sizes:
+    count = sizes[size]
+    sumSizes += size*count
+    nNodes += count
+  avgSize = float(sumSizes)/max(1, nNodes)
+  return avgSize
+
+def getMaxSize(sizes):
+  return max(sizes.keys())
+
+def getMinSize(sizes):
+  return min(sizes.keys())
+
 def getResults(pathMatrix):
   results = []
   for eHops in sorted(pathMatrix.keys()):
@@ -492,22 +619,42 @@ def runTest(store, processTotal=1):
   pathMatrix = testPaths(store, processTotal)
   avgStretch = getAvgStretch(pathMatrix)
   maxStretch = getMaxStretch(pathMatrix)
+  peers = getPeerSizes(store)
+  certs = getCertSizes(store)
+  paths = getPathSizes(store)
+  linkCerts = getMinLinkCertSizes(store)
+  avgPeerSize = getAvgSize(peers)
+  maxPeerSize = getMaxSize(peers)
+  avgCertSize = getAvgSize(certs)
+  maxCertSize = getMaxSize(certs)
+  avgPathSize = getAvgSize(paths)
+  maxPathSize = getMaxSize(paths)
+  avgLinkCert = getAvgSize(linkCerts)
+  maxLinkCert = getMaxSize(linkCerts)
+  totalCerts = sum(map(lambda x: x*certs[x], certs.keys()))
+  totalLinks = sum(map(lambda x: x*peers[x], peers.keys())) # one-way links
+  avgCertsPerLink = float(totalCerts)/max(1, totalLinks)
   print "Finished testing network"
   print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
+  print "Avg / Max nPeers size: {} / {}".format(avgPeerSize, maxPeerSize)
+  print "Avg / Max nCerts size: {} / {}".format(avgCertSize, maxCertSize)
+  print "Avg / Max total hops in any node's routing table: {} / {}".format(avgPathSize, maxPathSize)
+  print "Avg / Max lower bound cert requests per link (one-way): {} / {}".format(avgLinkCert, maxLinkCert)
+  print "Avg certs per link (one-way): {}".format(avgCertsPerLink)
   return # End of function
 
-def rootNodeASTest(path, processTotal=1):
+def rootNodeASTest(path, processTotal=1, outDir="output-treesim-AS", minTime=0):
   # Checks performance for every possible choice of root node
   # Saves output for each root node to a separate file on disk
   # path = input path to some caida.org formatted AS-relationship graph
   # processTotal = number of processes to run in parallel
-  outDir = "output-treesim-AS"
   if not os.path.exists(outDir): os.makedirs(outDir)
   assert os.path.exists(outDir)
   exists = sorted(glob.glob(outDir+"/*"))
   store = makeStoreASRelGraph(path)
   nodes = sorted(store.keys())
   for nodeIdx in xrange(len(nodes)):
+    start = time.time()
     rootNodeID = nodes[nodeIdx]
     outpath = outDir+"/{}".format(rootNodeID)
     if outpath in exists:
@@ -528,6 +675,10 @@ def rootNodeASTest(path, processTotal=1):
     print "Finished test for root AS {} ({} / {})".format(rootNodeID, nodeIdx+1, len(store))
     print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
     #break # Stop after 1, because they can take forever
+    end = time.time()
+    sleep = max(0., minTime - (end-start))
+    print "Sleeping for {0:.2f} seconds".format(sleep)
+    time.sleep(sleep)
   return # End of function
 
 def timelineASTest(processTotal=1):
@@ -563,6 +714,105 @@ def timelineASTest(processTotal=1):
     #break # Stop after 1, because they can take forever
   return # End of function
 
+def timelineDimesTest(processTotal=1):
+  # Meant to study the performance of the network as a function of network size
+  # Loops over a set of AS-relationship graphs
+  # Runs a test on each graph, selecting highest-degree node as the root
+  # Saves results for each graph to a separate file on disk
+  outDir = "output-treesim-timeline-dimes"
+  if not os.path.exists(outDir): os.makedirs(outDir)
+  assert os.path.exists(outDir)
+  # Input files are named ASEdgesX_Y where X = month (no leading 0), Y = year
+  paths = sorted(glob.glob("DIMES/ASEdges/*.gz"))
+  exists = set(glob.glob(outDir+"/*"))
+  for path in paths:
+    date = os.path.basename(path).split(".")[0]
+    outpath = outDir+"/{}".format(date)
+    if outpath in exists:
+      print "Skipping {}, already processed".format(date)
+      continue
+    store = makeStoreDimesEdges(path)
+    # Get the highest degree node and make it root
+    # Sorted by nodeID just to make it stable in the event of a tie
+    nodeIDs = sorted(store.keys())
+    bestRoot = ""
+    bestDeg = 0
+    for nodeID in nodeIDs:
+      node = store[nodeID]
+      if len(node.links) > bestDeg:
+        bestRoot = nodeID
+        bestDeg = len(node.links)
+    assert bestRoot
+    store = makeStoreDimesEdges(path, bestRoot)
+    rootID = "R" + bestRoot[1:]
+    assert rootID in store
+    # Don't forget to set random seed before setitng times
+    # To make results reproducible
+    nodeIDs = sorted(store.keys())
+    random.seed(12345)
+    for nodeID in nodeIDs:
+      node = store[nodeID]
+      node.info.time = random.randint(0, TIMEOUT)
+      node.info.tstamp = TIMEOUT
+    print "Beginning {}, size {}".format(date, len(store))
+    idleUntilConverged(store)
+    pathMatrix = testPaths(store, processTotal)
+    avgStretch = getAvgStretch(pathMatrix)
+    maxStretch = getMaxStretch(pathMatrix)
+    results = getResults(pathMatrix)
+    with open(outpath, "w") as f:
+      f.write(results)
+    print "Finished {} with {} nodes".format(date, len(store))
+    print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
+    break # Stop after 1, because they can take forever
+  return # End of function
+
+def scalingTest(processTotal=1, maxTests=None, inputDir="graphs"):
+  # Meant to study the performance of the network as a function of network size
+  # Loops over a set of nodes in a previously generated graph
+  # Runs a test on each graph, testing each node as the root
+  # if maxTests is set, tests only that number of roots (highest degree first)
+  # Saves results for each graph to a separate file on disk
+  outDir = "output-treesim-{}".format(inputDir)
+  if not os.path.exists(outDir): os.makedirs(outDir)
+  assert os.path.exists(outDir)
+  paths = sorted(glob.glob("{}/*".format(inputDir)))
+  exists = set(glob.glob(outDir+"/*"))
+  for path in paths:
+    gc.collect() # pypy waits for gc to close files
+    graph = os.path.basename(path).split(".")[0]
+    store = makeStoreGeneratedGraph(path)
+    # Get the highest degree node and make it root
+    # Sorted by nodeID just to make it stable in the event of a tie
+    nodeIDs = sorted(store.keys(), key=lambda x: len(store[x].links), reverse=True)
+    if maxTests: nodeIDs = nodeIDs[:maxTests]
+    for nodeID in nodeIDs:
+      nodeIDStr = str(nodeID).zfill(len(str(len(store)-1)))
+      outpath = outDir+"/{}-{}".format(graph, nodeIDStr)
+      if outpath in exists:
+        print "Skipping {}-{}, already processed".format(graph, nodeIDStr)
+        continue
+      store = makeStoreGeneratedGraph(path, nodeID)
+      # Don't forget to set random seed before setitng times
+      # To make results reproducible
+      random.seed(12345)
+      nIDs = sorted(store.keys())
+      for nID in nIDs:
+        node = store[nID]
+        node.info.time = random.randint(0, TIMEOUT)
+        node.info.tstamp = TIMEOUT
+      print "Beginning {}, size {}".format(graph, len(store))
+      idleUntilConverged(store)
+      pathMatrix = testPaths(store, processTotal)
+      avgStretch = getAvgStretch(pathMatrix)
+      maxStretch = getMaxStretch(pathMatrix)
+      results = getResults(pathMatrix)
+      with open(outpath, "w") as f:
+        f.write(results)
+      print "Finished {} with {} nodes for root {}".format(graph, len(store), nodeID)
+      print "Avg / Max stretch: {} / {}".format(avgStretch, maxStretch)
+  return # End of function
+
 ##################
 # Main Execution #
 ##################
@@ -575,7 +825,14 @@ if __name__ == "__main__":
     runTest(store, 1) # Quick test, 1 worker process
   # Do some real work
   #runTest(makeStoreDimesEdges("../../datasets/DIMES/ASEdges1_2007.csv"), cpus)
+  #timelineDimesTest(cpus)
   #rootNodeASTest("asrel/datasets/19980101.as-rel.txt", cpus)
   #timelineASTest(cpus)
-  rootNodeASTest("hype-rel.links", cpus)
+  #rootNodeASTest("hype-rel.links", cpus, "output-treesim-hype")
+  #scalingTest(cpus, None, "graphs-20") # second argument 1 to only test 1 root per graph
+  #store = makeStoreGeneratedGraph("bgp_tables")
+  #store = makeStoreGeneratedGraph("skitter")
+  #store = makeStoreASRelGraphMaxDeg("hype-rel.links", cpus)
+  #runTest(store, cpus)
+  rootNodeASTest("skitter", cpus, "output-treesim-skitter", 360)
 
