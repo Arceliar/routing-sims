@@ -54,6 +54,7 @@ class Node:
     bestDist = treeDist(best, dest)
     for peer in self.links:
       cs = self.links[peer].Coords
+      if cs[0] != self.Coords[0]: continue
       dist = treeDist(cs, dest)
       if dist < bestDist:
         best = cs
@@ -67,7 +68,9 @@ class Node:
       if info.sourceID == dest or isChordOrdered(dest, info.sourceID, best):
         best = info.sourceID
         bestNext = info.prevID
-      elif info.destID == dest or isChordOrdered(dest, info.destID, best):
+    for info in self.VSet:
+      break # Only check source direction for now
+      if info.destID == dest or isChordOrdered(dest, info.destID, best):
         best = info.destID
         bestNext = info.nextID
     for peerID in self.links:
@@ -136,7 +139,7 @@ def buildVSets(nodestore):
     sourceID = nodeIDs[sourceIdx]
     source = nodestore[sourceID]
     print "Builidng vset paths for node {} / {} ({})".format(sourceIdx+1, nNodes, sourceID)
-    for offset in [1, 2]: #[-2, -1, 1, 2]:
+    for offset in [1]: #[-2, -1, 1, 2]: # Only maintain one path for now, bare minimum for things to work
       destIdx = (sourceIdx + offset) % nNodes
       destID = nodeIDs[destIdx]
       dest = nodestore[destID]
@@ -308,6 +311,38 @@ def makeStoreGeneratedGraph(pathToGraph, root=None):
   print "Generated graph successfully imported, size {}".format(len(store))
   return store
 
+def connectComponents(nodestore):
+  nodeIDs = sorted(nodestore.keys())
+  nNodes = len(nodeIDs)
+  visited = set()
+  roots = set()
+  queue = []
+  def reset():
+    for nodeID in nodeIDs:
+      if nodeID in visited: continue
+      roots.add(nodeID)
+      heapq.heappush(queue, (0, nodeID))
+      return
+  reset()
+  while queue:
+    dist, nodeID = heapq.heappop(queue)
+    if nodeID in visited:
+      if len(queue) == 0: reset()
+      continue
+    visited.add(nodeID)
+    node = nodestore[nodeID]
+    for peer in node.links:
+      if peer in visited: continue
+      heapq.heappush(queue, (dist+LINK_COST, peer))
+    if len(queue) == 0: reset()
+  # Now link the roots
+  roots = sorted(roots)
+  for idx1 in xrange(len(roots)):
+    nodeID1 = roots[idx1]
+    for nodeID2 in roots[idx1+1:]:
+      linkNodes(nodestore[nodeID1], nodestore[nodeID2])
+  return
+
 #########
 # Tests #
 #########
@@ -384,6 +419,8 @@ def main():
   #store = makeStoreSquareGrid(4)
   #store = makeStoreGeneratedGraph("fc00-2017-08-12.txt")
   store = makeStoreGeneratedGraph("skitter")
+  # Make sure the whole network is in one connected component, this simplifies testing
+  connectComponents(store)
   # Build the spanning tree for Ygg, use it to build VRR vset paths
   buildTree(store, max(store.keys()))
   buildVSets(store)
@@ -399,6 +436,15 @@ def main():
   # Test results
   testPathStretch(store, "Ygg", ygg, dij)
   testPathStretch(store, "VRR", vrr, dij)
+  if True: # Source routing: minimum of vrr path, and then minimize that from A->B and B->A
+    for idx in xrange(len(vrr)):
+      vrr[idx] = min(vrr[idx], ygg[idx])
+    testPathStretch(store, "Min(ygg,vrr)", vrr, dij)
+    nNodes = len(store)
+    for sourceIdx in xrange(nNodes):
+      for destIdx in xrange(nNodes):
+        vrr[getCacheIndex(nNodes, sourceIdx, destIdx)] = min(vrr[getCacheIndex(nNodes, sourceIdx, destIdx)], vrr[getCacheIndex(nNodes, destIdx, sourceIdx)])
+    testPathStretch(store, "Min(s->d,d->s)", vrr, dij)
   testResourceUsage(store)
 
 if __name__ == '__main__':
